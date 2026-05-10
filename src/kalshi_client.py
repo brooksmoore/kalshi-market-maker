@@ -312,6 +312,8 @@ def place_limit_order(
     v2: executor.py passes the exact price it wants. Returns the order_id,
     or None on failure.
     """
+    # The [1, 99] integer-cent check is what makes this prod-grid compatible
+    # (Kalshi prod uses linear_cent — whole cents only). Don't relax it.
     if count < 1 or not (1 <= limit_price_cents <= 99):
         logging.warning("[KALSHI] Invalid order params count=%d price_cents=%d", count, limit_price_cents)
         return None
