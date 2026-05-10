@@ -1,0 +1,314 @@
+"""
+config.py — flat configuration for kalshi_bot_2.0.
+
+Single source of truth for all tunables. The constitution's pre-trade gate
+(evaluate_trade) is folded in at the bottom — no separate constitution.py.
+
+Addresses audit items:
+  M7 — exact Kalshi per-contract fee formula (kalshi_trade_fee)
+  M9 — portfolio Kelly cap (PORTFOLIO_KELLY_CAP)
+  M10 — per-settlement-day correlation bucket (CORRELATION_BUCKET_CAP)
+  R5 — fail-closed on stale bankroll (BANKROLL_STALE_SECONDS)
+  B4 — arbitrage min-edge and per-leg validation (MIN_EDGE_ARB, ARB_MIN_LEGS)
+"""
+
+from __future__ import annotations
+
+import math as _math
+import os
+from pathlib import Path
+
+# Load .env BEFORE any os.getenv() calls. config.py is the first module many
+# others import, so .env MUST be parsed here — not in kalshi_client.py — or
+# every os.getenv() below silently falls back to its default.
+try:
+    from dotenv import load_dotenv
+    _ROOT = Path(__file__).resolve().parents[1]
+    load_dotenv(_ROOT / ".env")
+except ImportError:
+    # python-dotenv optional for test environments; shell env vars still work.
+    pass
+
+# ─── Environment ─────────────────────────────────────────────────────────────
+# Demo by default. Flip KALSHI_API_URL in .env to move to production.
+KALSHI_API_URL: str = os.getenv(
+    "KALSHI_API_URL",
+    "https://demo-api.kalshi.co/trade-api/v2",
+)
+
+# Trading is HALTED on boot. Flip LIVE_TRADING_ENABLED=true in .env when ready.
+LIVE_TRADING_ENABLED: bool = (
+    os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+)
+
+# Claude veto filter (single YES/NO call per candidate). Never touches probability.
+CLAUDE_VETO_ENABLED: bool = (
+    os.getenv("CLAUDE_VETO_ENABLED", "false").lower() == "true"
+)
+
+# ─── Bankroll & sizing ───────────────────────────────────────────────────────
+STARTING_BANKROLL: float = 100.0     # $100 demo paper
+KELLY_FRACTION: float = 0.25
+MAX_SINGLE_BET_PCT: float = 0.05     # hard 5% per-trade cap
+MIN_POSITION: float = 1.00
+
+# Portfolio-level Kelly cap — audit M9.
+# Sum of open kellys + any proposed new kelly must not exceed bankroll * this.
+PORTFOLIO_KELLY_CAP: float = 0.90
+
+# Settlement-day cluster cap — audit M10.
+# Sum of positions settling within a cluster window must not exceed bankroll * this.
+CORRELATION_BUCKET_CAP: float = 0.50
+CLUSTER_WINDOW_HOURS: int = 6
+
+# ─── Edge thresholds ─────────────────────────────────────────────────────────
+MIN_EDGE: float = 0.08               # weather core
+MIN_EDGE_ARB: float = 0.02           # fee-inclusive arb edge floor
+ARB_MIN_LEGS: int = 3
+
+# ─── Price filters ───────────────────────────────────────────────────────────
+MIN_PRICE: float = 0.15
+MAX_PRICE: float = 0.90
+THIN_MARKET_LO: float = 0.03
+THIN_MARKET_HI: float = 0.97
+
+# ─── Execution ───────────────────────────────────────────────────────────────
+MAKER_REST_SECONDS: int = 180
+MAKER_PRICE_OFFSET_CENTS: int = 1
+SLIPPAGE_BUFFER_PCT: float = 0.02
+
+# ─── Scan cadence ────────────────────────────────────────────────────────────
+SCAN_INTERVAL_SECONDS: int = 300
+
+# ─── Halts ───────────────────────────────────────────────────────────────────
+MAX_DRAWDOWN_PCT: float = 0.33
+DAILY_LOSS_LIMIT_PCT: float = 0.20
+BANKROLL_STALE_SECONDS: int = 120    # fail-closed if bankroll older than this
+
+# ─── Kalshi fees ─────────────────────────────────────────────────────────────
+KALSHI_FEE_RATE: float = 0.07
+
+
+def kalshi_trade_fee(contracts: float, price: float) -> float:
+    """Per-fill Kalshi fee in dollars, ceiled to the cent.
+
+    Formula (standard tier): fee = ceil(rate * contracts * price * (1-price) * 100) / 100.
+    Winner settles at $1.00 so sell-side fee is 0. Copied verbatim from v1 config.py
+    (correct per audit M7). Accepts fractional contracts for pre-trade edge calcs.
+    """
+    if contracts <= 0 or price <= 0 or price >= 1:
+        return 0.0
+    raw = KALSHI_FEE_RATE * contracts * price * (1.0 - price)
+    return _math.ceil(raw * 100) / 100
+
+
+# ─── Files ───────────────────────────────────────────────────────────────────
+DATA_DIR: str = "data"
+DB_FILE: str = os.path.join(DATA_DIR, "trades.db")
+PERF_FILE: str = os.path.join(DATA_DIR, "performance.json")
+CALIBRATION_PKL: str = os.path.join(DATA_DIR, "calibration.pkl")
+CALIBRATION_META: str = os.path.join(DATA_DIR, "calibration.meta.json")
+LOG_FILE: str = os.path.join("logs", "bot.log")
+
+# v1 database path — read-only source for bootstrapping calibration.
+V1_DB_PATH: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "polymarket-bot", "trades.db",
+)
+
+# ─── Cities and series ───────────────────────────────────────────────────────
+# High-temperature markets on Kalshi. Copied from v1 kalshi.py:18 (14 cities).
+
+# IANA timezone for each city — used to compute daily-max in the correct local
+# window.  Previously hardcoded to America/New_York in forecast.py, which caused
+# tail errors of up to 5.5°F for non-Eastern cities (Denver, Chicago, Seattle).
+CITY_TZ: dict[str, str] = {
+    "NYC":          "America/New_York",
+    "Chicago":      "America/Chicago",
+    "Miami":        "America/New_York",
+    "LA":           "America/Los_Angeles",
+    "Austin":       "America/Chicago",
+    "Denver":       "America/Denver",
+    "Philadelphia": "America/New_York",
+    "Houston":      "America/Chicago",
+    "Boston":       "America/New_York",
+    "Phoenix":      "America/Phoenix",
+    "Dallas":       "America/Chicago",
+    "Seattle":      "America/Los_Angeles",
+    "Atlanta":      "America/New_York",
+    "SF":           "America/Los_Angeles",
+    # Added 2026-05-02 from Kalshi series discovery.
+    "Las Vegas":    "America/Los_Angeles",
+    "San Antonio":  "America/Chicago",
+    "Oklahoma City":"America/Chicago",
+    "DC":           "America/New_York",
+    "New Orleans":  "America/Chicago",
+}
+
+# NWS CLI (Climatological Report Daily) vs ASOS hourly bias, measured over 90
+# days of Kalshi production settlements (scripts/cli_gap_audit.py, 2026-04-27).
+# CLI is systematically warmer than ASOS — likely due to 5-minute vs hourly
+# peak capture.  Applied as an additive shift to raw GEFS members so that
+# probability calculations are anchored to the CLI settlement value rather than
+# the ASOS-aligned model output.
+CLI_BIAS: dict[str, float] = {
+    "NYC":          0.62,
+    "Chicago":      0.58,
+    "Miami":        0.97,
+    "LA":           0.80,
+    "Austin":       0.93,
+    "Denver":       0.93,
+    "Philadelphia": 0.72,
+    "Houston":      0.25,
+    "Boston":       0.54,
+    "Phoenix":      1.09,
+    "Dallas":       0.73,
+    "Seattle":      0.61,
+    "Atlanta":      0.90,
+    "SF":           0.95,
+    # New cities from Kalshi discovery — bias not yet measured. Default
+    # 0.0 = no shift; will calibrate as we accumulate resolved trades.
+    "Las Vegas":    0.0,
+    "San Antonio":  0.0,
+    "Oklahoma City":0.0,
+    "DC":           0.0,
+    "New Orleans":  0.0,
+}
+
+# Climatological monthly mean high temperatures (°F) per city. Used by the
+# Claude veto sanity-check prompt to give the model a comparison baseline
+# for "is this forecast plausible." Hand-coded from public NOAA normals;
+# precision is fine to within a couple degrees — Claude only uses these
+# as context, not for any quantitative decision.
+CITY_CLIMO_HIGH_F: dict[str, list[int]] = {
+    # index 0 = January, 11 = December
+    "NYC":          [40, 43, 51, 62, 72, 80, 85, 84, 76, 65, 54, 44],
+    "Chicago":      [32, 36, 47, 60, 70, 80, 85, 83, 76, 63, 49, 36],
+    "Miami":        [76, 78, 81, 84, 87, 90, 91, 91, 89, 86, 81, 77],
+    "LA":           [68, 69, 70, 73, 74, 78, 83, 84, 82, 78, 73, 68],
+    "Austin":       [62, 66, 73, 80, 87, 92, 96, 97, 91, 82, 71, 63],
+    "Denver":       [45, 48, 56, 62, 71, 82, 89, 87, 79, 65, 53, 44],
+    "Philadelphia": [42, 45, 53, 64, 74, 83, 87, 85, 78, 67, 56, 46],
+    "Houston":      [64, 67, 73, 80, 86, 91, 94, 94, 89, 82, 72, 65],
+    "Boston":       [37, 39, 46, 56, 67, 76, 82, 80, 73, 62, 52, 41],
+    "Phoenix":      [68, 72, 78, 86, 95, 104, 106, 104, 100, 89, 76, 67],
+    "Dallas":       [57, 62, 70, 77, 84, 92, 96, 96, 89, 79, 67, 59],
+    "Seattle":      [48, 50, 54, 59, 65, 70, 76, 76, 71, 60, 52, 47],
+    "Atlanta":      [54, 58, 65, 73, 80, 87, 90, 89, 83, 73, 64, 56],
+    "SF":           [57, 60, 62, 64, 65, 67, 67, 68, 70, 69, 63, 57],
+    "Las Vegas":    [58, 64, 71, 79, 89, 99, 105, 103, 96, 83, 69, 58],
+    "San Antonio":  [62, 67, 73, 80, 87, 92, 95, 95, 90, 82, 71, 64],
+    "Oklahoma City":[51, 56, 64, 72, 79, 87, 93, 92, 84, 73, 62, 53],
+    "DC":           [44, 47, 55, 66, 75, 83, 87, 86, 79, 68, 57, 47],
+    "New Orleans":  [62, 65, 71, 78, 85, 90, 91, 91, 88, 80, 70, 64],
+}
+
+
+# Path for the cached forecast-health JSON, written by forecast_health.py and
+# served by the dashboard's /api/forecast_health endpoint.
+FORECAST_HEALTH_FILE: str = str(Path("data/forecast_health.json"))
+WEATHER_SERIES: dict[str, str] = {
+    "NYC":          "KXHIGHNY",
+    "Chicago":      "KXHIGHCHI",
+    "Miami":        "KXHIGHMIA",
+    "LA":           "KXHIGHLAX",
+    "Austin":       "KXHIGHAUS",
+    "Denver":       "KXHIGHDEN",
+    "Philadelphia": "KXHIGHPHIL",
+    "Houston":      "KXHIGHTHOU",
+    "Boston":       "KXHIGHTBOS",
+    "Phoenix":      "KXHIGHTPHX",
+    "Dallas":       "KXHIGHTDAL",
+    "Seattle":      "KXHIGHTSEA",
+    "Atlanta":      "KXHIGHTATL",
+    "SF":           "KXHIGHTSFO",
+}
+
+# Airport lat/lon for Open-Meteo ensemble query. From v1 noaa.py:42
+# (high-temp cities only — we cut precip and low-temp in v2).
+CITIES: dict[str, dict[str, float]] = {
+    "NYC":          {"lat": 40.7789, "lon": -73.9692},   # Central Park (KNYC)
+    "Chicago":      {"lat": 41.7868, "lon": -87.7522},   # KMDW
+    "Miami":        {"lat": 25.7959, "lon": -80.2870},   # KMIA
+    "LA":           {"lat": 33.9425, "lon": -118.4081},  # KLAX
+    "Austin":       {"lat": 30.1945, "lon": -97.6699},   # KAUS
+    "Denver":       {"lat": 39.8561, "lon": -104.6737},  # KDEN
+    "Philadelphia": {"lat": 39.8721, "lon": -75.2408},   # KPHL
+    "Houston":      {"lat": 29.6454, "lon": -95.2789},   # KHOU
+    "Boston":       {"lat": 42.3656, "lon": -71.0096},   # KBOS
+    "Phoenix":      {"lat": 33.4373, "lon": -112.0078},  # KPHX
+    "Dallas":       {"lat": 32.8998, "lon": -97.0403},   # KDFW
+    "Seattle":      {"lat": 47.4502, "lon": -122.3088},  # KSEA
+    "Atlanta":      {"lat": 33.6404, "lon": -84.4281},   # KATL
+    "SF":           {"lat": 37.6213, "lon": -122.3790},  # KSFO
+    # Added 2026-05-02 from Kalshi series discovery.
+    "Las Vegas":    {"lat": 36.0840, "lon": -115.1537},  # KLAS
+    "San Antonio":  {"lat": 29.5337, "lon": -98.4698},   # KSAT
+    "Oklahoma City":{"lat": 35.3931, "lon": -97.6007},   # KOKC
+    "DC":           {"lat": 38.8521, "lon": -77.0377},   # KDCA
+    "New Orleans":  {"lat": 29.9934, "lon": -90.2580},   # KMSY
+}
+
+
+# ─── Constitution: pre-trade gate (folded in from v1 constitution.py) ────────
+def evaluate_trade(opportunity: dict, bankroll: float | None = None) -> tuple[bool, list[str]]:
+    """Hard pre-trade rules. Returns (ok, violations).
+
+    Enforces: 5% single-bet sizing cap, thin-market guard, MIN_EDGE floor.
+    No per-city-bias zone guards in v2 (replaced by ensemble + isotonic).
+
+    `bankroll`: if provided, use this value for the size cap calculation.
+    Otherwise read the live Kalshi bankroll. Polymarket paper trades pass
+    STARTING_BANKROLL ($100) since they're sized against a separate paper
+    book, not the live Kalshi balance.
+    """
+    violations: list[str] = []
+
+    if bankroll is None:
+        from risk import get_active_bankroll
+        bankroll, _age = get_active_bankroll()
+    max_bet = bankroll * MAX_SINGLE_BET_PCT
+    size = float(opportunity.get("recommended_size", 0.0) or 0.0)
+    # Use the price of the side we'd actually buy. The opp's `entry_price` is
+    # set by strategy.find_opportunities to no_ask for BUY NO and yes_ask for
+    # BUY YES; falling back to yes_price (== yes_ask) preserves prior behavior
+    # for arb opps and any caller that doesn't populate entry_price.
+    entry_price = float(opportunity.get("entry_price")
+                        or opportunity.get("yes_price", 0.5) or 0.5)
+    edge = float(opportunity.get("edge", 0.0) or 0.0)
+    market_type = opportunity.get("market_type", "")
+
+    # 1. Hard size cap
+    if size > max_bet + 0.005:
+        violations.append(
+            f"OVERSIZE: ${size:.2f} exceeds ${max_bet:.2f} cap "
+            f"(bankroll=${bankroll:.0f})"
+        )
+
+    # 2. Thin-market guard — checked against the side we'd actually buy.
+    if entry_price < THIN_MARKET_LO or entry_price > THIN_MARKET_HI:
+        violations.append(
+            f"THIN_MARKET: entry_price={entry_price:.3f} — liquidity too low"
+        )
+
+    # 3. MIN_EDGE floor (arb uses MIN_EDGE_ARB)
+    floor = MIN_EDGE_ARB if market_type == "arbitrage" else MIN_EDGE
+    if edge < floor:
+        violations.append(
+            f"EDGE_FLOOR: edge={edge:.3f} below {floor:.3f} minimum"
+        )
+
+    # 4. Price window (skip for arb — arb edge is mechanical).
+    #    Checks the buy-side price; previously used yes_price, which silently
+    #    rejected every BUY NO trade where yes_ask was outside the window.
+    if market_type != "arbitrage":
+        if entry_price < MIN_PRICE:
+            violations.append(
+                f"PRICE_LOW: entry_price={entry_price:.3f} below MIN_PRICE={MIN_PRICE}"
+            )
+        if entry_price > MAX_PRICE:
+            violations.append(
+                f"PRICE_HIGH: entry_price={entry_price:.3f} above MAX_PRICE={MAX_PRICE}"
+            )
+
+    return (len(violations) == 0), violations
