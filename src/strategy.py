@@ -63,12 +63,25 @@ from risk import kelly_size
 #       cosmetic *today*. The math is wired correctly to bind at higher
 #       bankroll or relaxed caps; we are not raising the cap in this audit.
 #
-# Spread filter (MAX_NO_SPREAD_FOR_BIN) gates entries; Wilson sizing shrinks
+# Spread filter (MAX_ENTRY_SPREAD) gates entries; Wilson sizing shrinks
 # Kelly on small-k tail bins. Together they target the two failure modes
 # without hand-fitting a sweet-spot gate to the 35 historical 1°F BUY NO
 # trades — that sample is too small to pre-commit a hard edge/entry-band
 # rule (Wilson 95% CI on 9/10 sweet-spot wins is [55%, 99%]).
-MAX_NO_SPREAD_FOR_BIN: float = 0.10  # $0.10 wide max on no-side for B-tickers
+#
+# 2026-05-10: extended from "B-ticker BUY NO only" to ALL ticker kinds + BOTH
+# actions. Original audit gated only 1°F bin BUY NO because that's where the
+# observed failure mode was, with a hypothesis that "T-tickers self-select to
+# deeper books." Prod observer data (~5400 snapshots) shows T-tickers are only
+# marginally tighter than B-tickers (mean 1.62c vs 1.80c) and have similar
+# tails — uniform liquidity profile across kinds. Extending the gate is
+# cheaper than carrying an asymmetric strategy rule whose original rationale
+# is no longer supported. Wide-spread rejection on BUY YES catches the
+# symmetric failure mode (no resting bid on the side we'd need to exit at).
+# Value is still $0.10 here; the empirically-supported tightening to ~$0.03
+# is deferred until overnight + morning observer coverage confirms the
+# distribution holds across the GEFS-run cycle.
+MAX_ENTRY_SPREAD: float = 0.10  # $0.10 wide max on the side we'd buy
 WILSON_Z: float = 1.96  # 95% CI
 
 
@@ -633,21 +646,23 @@ def find_opportunities(markets: list[dict], bankroll: float,
             rej["price_window"] += 1
             continue
 
-        # Spread-tightness gate (audit 2026-05-09, see header comment).
-        # Only applied to 1°F bins because (a) that's where the failure mode
-        # was observed — three of five open positions on 2026-05-09 had
-        # 0.40+ wide no-side spreads — and (b) wider markets like T-tickers
-        # already self-select to deeper books on Kalshi's weather series.
-        # Extending the filter to T-tickers can be considered after we have
-        # a few weeks of post-fix data; doing it now would be a strategy
-        # change beyond what the audit evidence supports.
-        if is_1f_bin and action == "BUY NO":
-            if no_bid <= 0:
-                rej["wide_spread"] += 1
-                continue
-            if (no_ask - no_bid) > MAX_NO_SPREAD_FOR_BIN:
-                rej["wide_spread"] += 1
-                continue
+        # Spread-tightness gate (header comment for full history). Applied
+        # uniformly to all ticker kinds and both actions as of 2026-05-10
+        # based on prod observer data showing similar spread distributions
+        # across kinds. Two failure modes caught by one rule:
+        #   • Wide spread on the buy side → entry cost eats the edge.
+        #   • Zero bid on the buy side → no exit liquidity if we want out
+        #     before settlement (one-sided book).
+        if action == "BUY YES":
+            side_bid, side_ask = yes_bid, yes_ask
+        else:  # BUY NO
+            side_bid, side_ask = no_bid, no_ask
+        if side_bid <= 0:
+            rej["wide_spread"] += 1
+            continue
+        if (side_ask - side_bid) > MAX_ENTRY_SPREAD:
+            rej["wide_spread"] += 1
+            continue
 
         # Wilson-shrunk sizing (audit 2026-05-09, see header comment).
         # Compute k (members in bracket) and N (ensemble size) for the Wilson

@@ -9,7 +9,7 @@ prints a human-readable report:
   3. Depth distribution at top of book
   4. Time-of-day cut (hour-of-day × median spread, median top-of-book size)
   5. Spread autocorrelation across cycles (how much does spread move 5 min later?)
-  6. Gate calibration table: at MAX_NO_SPREAD_FOR_BIN = Xc, what % of markets pass?
+  6. Gate calibration table: at MAX_ENTRY_SPREAD = Xc, what % of markets pass?
 
 This is a pure read tool. Safe to run while the observer is writing
 (prod_observer.db uses WAL mode). Run anytime — output adapts to whatever
@@ -143,32 +143,35 @@ def main() -> None:
     # ── 3. Gate calibration table ────────────────────────────────────────────
     print()
     print("=" * 72)
-    print("GATE CALIBRATION — at MAX_NO_SPREAD_FOR_BIN = Xc, what passes?")
+    print("GATE CALIBRATION — at MAX_ENTRY_SPREAD = Xc, what passes?")
     print("=" * 72)
     print()
-    # Restricted to B-tickers since the gate is B-only
-    b_total = _q(
+    # 2026-05-10: gate now applies uniformly across ticker kinds + both
+    # actions (strategy.py MAX_ENTRY_SPREAD). spread_yes_c == spread_no_c
+    # for any two-sided book (orderbook symmetry), so we count any snapshot
+    # with at least one side fully quoted.
+    total = _q(
         conn,
-        f"SELECT COUNT(*) FROM book_snapshot WHERE {where} AND kind='B' "
+        f"SELECT COUNT(*) FROM book_snapshot WHERE {where} "
         f"AND no_bid > 0 AND no_ask IS NOT NULL",
         bind_t,
     )[0][0]
-    if b_total > 0:
-        print(f"  base: {b_total} B-ticker snapshots with two-sided book")
+    if total > 0:
+        print(f"  base: {total} two-sided snapshots (all kinds, both actions)")
         print()
         print(f"  {'gate':>5} {'pass %':>7} {'reject %':>9}  histogram")
         for gate_c in [1, 2, 3, 4, 5, 6, 8, 10, 15, 20]:
             passed = _q(
                 conn,
-                f"SELECT COUNT(*) FROM book_snapshot WHERE {where} AND kind='B' "
+                f"SELECT COUNT(*) FROM book_snapshot WHERE {where} "
                 f"AND no_bid > 0 AND no_ask IS NOT NULL AND spread_no_c <= ?",
                 bind_t + (gate_c,),
             )[0][0]
-            pct_pass = passed / b_total * 100
+            pct_pass = passed / total * 100
             pct_rej = 100 - pct_pass
             print(f"  {gate_c:>4}c {pct_pass:>6.1f}% {pct_rej:>8.1f}%  {_bar(int(pct_pass / 2.5))}")
     else:
-        print("  no two-sided B-ticker snapshots yet")
+        print("  no two-sided snapshots yet")
 
     # ── 4. Depth at top of book ──────────────────────────────────────────────
     print()
