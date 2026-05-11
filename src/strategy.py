@@ -81,7 +81,12 @@ from risk import kelly_size
 # Value is still $0.10 here; the empirically-supported tightening to ~$0.03
 # is deferred until overnight + morning observer coverage confirms the
 # distribution holds across the GEFS-run cycle.
-MAX_ENTRY_SPREAD: float = 0.10  # $0.10 wide max on the side we'd buy
+# 2026-05-10: tightened 0.10 → 0.03 based on prod observer data (n=2768
+# two-sided snapshots): demo-era 10c gate filtered nothing on prod where
+# spreads are 1-3c. 3c passes ~88% of observed markets while rejecting
+# the rare 5-10c wide tail. Re-evaluate after overnight + morning observer
+# coverage; raise marginally (4c) if morning shows systematic widening.
+MAX_ENTRY_SPREAD: float = 0.03  # $0.03 wide max on the side we'd buy
 WILSON_Z: float = 1.96  # 95% CI
 
 

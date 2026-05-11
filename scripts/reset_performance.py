@@ -11,14 +11,17 @@ What it does:
      of 0 (the bot's first cycle will repopulate from Kalshi), the current
      env's venue_signature stamped, and a reset_note recording when/why.
 
-What it does NOT do:
-  - Touch trades.db. Trade history is preserved for calibration analysis.
+What it does NOT do by default:
+  - Touch trades.db (use --wipe-trades for that — needed at the demo→prod
+    flip, since the existing `venue` column only distinguishes Kalshi from
+    Polymarket, not demo Kalshi from prod Kalshi).
   - Touch calibration.pkl. If you want a fresh calibration too, remove
     data/calibration.pkl manually (or it'll stay identity until refit).
 
 Usage:
     venv/bin/python scripts/reset_performance.py
-    venv/bin/python scripts/reset_performance.py --force   # skip confirmation
+    venv/bin/python scripts/reset_performance.py --force          # skip prompt
+    venv/bin/python scripts/reset_performance.py --wipe-trades    # also wipe trades.db
 
 Always asks for confirmation unless --force is passed.
 """
@@ -36,7 +39,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from config import PERF_FILE  # noqa: E402
+from config import DB_FILE, PERF_FILE  # noqa: E402
 from risk import _current_venue_signature  # noqa: E402
 
 
@@ -44,9 +47,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true",
                     help="skip the interactive confirmation prompt")
+    ap.add_argument("--wipe-trades", action="store_true",
+                    help="also archive and remove data/trades.db (use at "
+                         "demo→prod flip; storage.init_db() recreates it)")
     args = ap.parse_args()
 
     perf_path = Path(PERF_FILE)
+    db_path = Path(DB_FILE)
     archive_dir = perf_path.parent / "_archive"
     archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -81,9 +88,28 @@ def main() -> int:
     print(f"New venue_signature will be: {sig or '(none — env unset)'}")
     print()
 
-    if not args.force:
+    # Trades.db preview (only if --wipe-trades)
+    trade_count = 0
+    if args.wipe_trades and db_path.exists():
+        import sqlite3
         try:
-            ans = input("Archive current performance.json and write fresh baseline? [y/N] ")
+            with sqlite3.connect(db_path) as c:
+                trade_count = c.execute(
+                    "SELECT COUNT(*) FROM trades"
+                ).fetchone()[0]
+        except Exception as e:
+            print(f"warning: could not count trades.db rows: {e}")
+        print(f"--wipe-trades: will archive trades.db ({trade_count} rows) and remove it")
+        print(f"  bot's next boot will recreate empty schema via storage.init_db()")
+        print()
+
+    if not args.force:
+        prompt = "Archive performance.json"
+        if args.wipe_trades:
+            prompt += f" AND wipe trades.db ({trade_count} rows)"
+        prompt += " and write fresh baseline? [y/N] "
+        try:
+            ans = input(prompt)
         except EOFError:
             ans = ""
         if ans.strip().lower() not in ("y", "yes"):
@@ -117,8 +143,25 @@ def main() -> int:
     perf_path.parent.mkdir(parents=True, exist_ok=True)
     perf_path.write_text(json.dumps(fresh, indent=2))
     print(f"wrote fresh → {perf_path}")
+
+    # Wipe trades.db if requested (after perf reset to avoid half-state)
+    if args.wipe_trades and db_path.exists():
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        db_archive = archive_dir / f"trades.db.before_reset_{stamp}"
+        shutil.copy2(db_path, db_archive)
+        print(f"archived trades.db → {db_archive}")
+        # Also remove any sqlite WAL/SHM journal artifacts so next boot
+        # starts cleanly (storage.init_db creates fresh schema).
+        for ext in ("", "-wal", "-shm", "-journal"):
+            p = db_path.parent / (db_path.name + ext)
+            if p.exists():
+                p.unlink()
+        print(f"removed {db_path} (and any -wal/-shm journals)")
+
     print()
     print("Next bot boot will populate bankroll/cash from the live Kalshi API.")
+    if args.wipe_trades:
+        print("Trades table will be recreated empty by storage.init_db().")
     return 0
 
 
