@@ -49,7 +49,12 @@ CLAUDE_VETO_ENABLED: bool = (
 # ─── Bankroll & sizing ───────────────────────────────────────────────────────
 STARTING_BANKROLL: float = 100.0     # $100 demo paper
 KELLY_FRACTION: float = 0.25
-MAX_SINGLE_BET_PCT: float = 0.05     # hard 5% per-trade cap
+# 2026-05-10: tightened from 5% → 2.5% ahead of prod transition. At a $200
+# prod starting bankroll, 2.5% = $5 max per trade (~10 contracts at $0.50,
+# ~5 at $0.95). Preserves Kelly's relative sizing across opportunities
+# while keeping per-trade blast radius tiny during the proof-of-concept
+# cohort. Revisit after ≥50 resolved prod trades + calibration refit.
+MAX_SINGLE_BET_PCT: float = 0.025    # hard 2.5% per-trade cap
 MIN_POSITION: float = 1.00
 
 # Portfolio-level Kelly cap — audit M9.
@@ -81,8 +86,13 @@ SLIPPAGE_BUFFER_PCT: float = 0.02
 SCAN_INTERVAL_SECONDS: int = 300
 
 # ─── Halts ───────────────────────────────────────────────────────────────────
-MAX_DRAWDOWN_PCT: float = 0.33
-DAILY_LOSS_LIMIT_PCT: float = 0.20
+# 2026-05-10: tightened DRAWDOWN 33→25% and DAILY 20→15% ahead of prod
+# transition. Demo-era values assumed losses didn't matter; prod values
+# need to fire well before the proof-of-concept cohort burns through too
+# much of the small initial bankroll. At $200 bankroll: drawdown halt at
+# -$50, daily halt at -$30. Re-evaluate after first live cohort settles.
+MAX_DRAWDOWN_PCT: float = 0.25
+DAILY_LOSS_LIMIT_PCT: float = 0.15
 BANKROLL_STALE_SECONDS: int = 120    # fail-closed if bankroll older than this
 
 # ─── Kalshi fees ─────────────────────────────────────────────────────────────

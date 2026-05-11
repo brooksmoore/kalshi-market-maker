@@ -840,6 +840,17 @@ def main() -> None:
     logging.info("[MAIN] kalshi_bot_2.0 boot. LIVE_TRADING_ENABLED=%s",
                  LIVE_TRADING_ENABLED)
 
+    # Fail-closed: refuse to start if performance.json was created against a
+    # different Kalshi account. Catches the demo→prod (and prod→prod) swap
+    # case before any state mutation corrupts drawdown math. See
+    # risk.check_venue_signature() for details.
+    try:
+        risk.check_venue_signature()
+    except risk.VenueSignatureMismatch as e:
+        logging.error("[MAIN] %s", e)
+        print(f"\nFATAL: {e}\n", file=sys.stderr)
+        sys.exit(2)
+
     storage.init_db()
 
     if not kalshi_client.verify_api_connection():

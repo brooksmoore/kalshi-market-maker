@@ -12,6 +12,7 @@ Addresses audit items:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -363,16 +364,94 @@ def _atomic_write_perf(data: dict) -> None:
 def peak_pnl_update(current_pnl: float) -> float:
     """Monotonic peak tracker. Reads current, writes new_peak = max(prior, current).
 
-    NEVER writes lower. Atomic via tempfile+rename (audit R1/B8).
+    NEVER writes lower. Atomic via tempfile+rename (audit R1/B8). Also stamps
+    the current venue signature on any write so a future credential swap
+    surfaces a clear mismatch error instead of silently corrupting drawdown
+    math (see check_venue_signature).
     """
     data = _read_perf()
     prior = float(data.get("peak_pnl", 0.0) or 0.0)
     new_peak = max(prior, float(current_pnl))
-    if new_peak > prior:
+    sig = _current_venue_signature()
+    sig_needs_update = bool(sig) and data.get("venue_signature") != sig
+    if new_peak > prior or sig_needs_update:
         data["peak_pnl"] = new_peak
         data["peak_updated_at"] = datetime.now().isoformat()
+        if sig:
+            data["venue_signature"] = sig
         _atomic_write_perf(data)
     return new_peak
+
+
+# ─── Venue signature (fail-closed on credential swap) ────────────────────────
+# performance.json carries per-venue state (peak_pnl, drawdown baseline, etc.).
+# If the bot's .env is repointed to a different Kalshi account — e.g., demo →
+# prod, or one prod account → another — the local state is meaningless against
+# the new account and would silently corrupt drawdown math from cycle one.
+# venue_signature is a stable short hash of (KALSHI_API_URL, KALSHI_API_KEY_ID)
+# stamped on performance.json. On boot, check_venue_signature() refuses to
+# start the bot when the stamp doesn't match the current env. Same fail-closed
+# discipline as BANKROLL_STALE_SECONDS — we'd rather halt loudly than trade
+# against corrupted state.
+
+def _current_venue_signature() -> str:
+    """Return a stable 12-char hash of (KALSHI_API_URL, KALSHI_API_KEY_ID).
+
+    Empty string if either env var is missing — caller decides whether that
+    is fatal (it's checked upstream during API connect).
+    """
+    api_url = os.getenv("KALSHI_API_URL", "")
+    key_id = os.getenv("KALSHI_API_KEY_ID", "")
+    if not api_url or not key_id:
+        return ""
+    payload = f"{api_url}|{key_id}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
+class VenueSignatureMismatch(RuntimeError):
+    """Raised when performance.json's stored signature doesn't match the
+    current env. The bot must not trade in this state — drawdown math would
+    be computed against a different account's history."""
+
+
+def check_venue_signature() -> None:
+    """Halt boot if performance.json was created against a different Kalshi
+    account than the current env. Pass-through on first run (no file) or
+    legacy file (no stored signature) — in the latter case we stamp the
+    current signature now so future swaps are caught.
+
+    Raises VenueSignatureMismatch on hard mismatch.
+    """
+    current_sig = _current_venue_signature()
+    if not current_sig:
+        # No env credentials yet; the API verify step will report this.
+        return
+    data = _read_perf()
+    stored_sig = data.get("venue_signature")
+    if not stored_sig:
+        # First run OR legacy file from before this check existed. Stamp the
+        # current signature so subsequent boots have something to compare.
+        # If data is empty (file doesn't exist), don't fabricate a write —
+        # the next peak_pnl_update will stamp it naturally.
+        if data:
+            data["venue_signature"] = current_sig
+            data["venue_signature_stamped_at"] = datetime.now().isoformat()
+            _atomic_write_perf(data)
+            logging.info(
+                "[RISK] stamped venue_signature=%s on existing performance.json",
+                current_sig,
+            )
+        return
+    if stored_sig != current_sig:
+        raise VenueSignatureMismatch(
+            f"performance.json was created against a different Kalshi account "
+            f"(stored signature={stored_sig}, current env signature={current_sig}). "
+            f"Trading against the current account with this local state would "
+            f"corrupt drawdown math (peak_bankroll, daily_loss baseline, etc.). "
+            f"Either restore the matching credentials in .env, OR reset the "
+            f"local state by running: "
+            f"venv/bin/python scripts/reset_performance.py"
+        )
 
 
 def realized_pnl_total() -> float:
