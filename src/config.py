@@ -48,7 +48,18 @@ CLAUDE_VETO_ENABLED: bool = (
 
 # ─── Bankroll & sizing ───────────────────────────────────────────────────────
 STARTING_BANKROLL: float = 100.0     # $100 demo paper
-KELLY_FRACTION: float = 0.25
+# 2026-05-10: lowered from 0.25 → 0.10 ahead of prod transition. At 0.25
+# the 2.5% per-trade cap was binding on almost every positive-edge trade,
+# lumping all bets at the cap and erasing Kelly's relative-conviction
+# signal (high-edge trades = same size as low-edge trades). 0.10 lets
+# the cap relax for mid-distribution trades while still binding for the
+# most aggressive ones, preserving position-weighted variance for the
+# calibration-cohort analysis. Also smaller avg trade → more attempts
+# within the daily loss limit before halt. REVISIT (raise back toward
+# 0.25 or higher) once calibration is fit and edge is empirically
+# established on prod — at that point larger sizing = more profit and
+# this throttle becomes a tax on proven edge.
+KELLY_FRACTION: float = 0.10
 # 2026-05-10: tightened from 5% → 2.5% ahead of prod transition. At a $200
 # prod starting bankroll, 2.5% = $5 max per trade (~10 contracts at $0.50,
 # ~5 at $0.95). Preserves Kelly's relative sizing across opportunities
