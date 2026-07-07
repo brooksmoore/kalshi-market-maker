@@ -1,5 +1,17 @@
 .env
+.env.*
+!.env.example
 *.pem
+
+# Internal ops/audit docs (bot-local working notes, not for the public repo)
+AGENTS.md
+CLAUDE.md
+GROK.md
+
+# Runtime artifacts / stray temp files, not source
+data/.fuse_hidden*
+data/*.jsonl
+data/*.log
 data/**/*.db
 data/**/*.db.*
 data/**/*.db-shm

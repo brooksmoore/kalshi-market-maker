@@ -533,10 +533,84 @@ def _process_opportunity(opp: dict, bankroll: float) -> str:
         return f"skipped:{cash_reason}"
 
     if not LIVE_TRADING_ENABLED:
-        # Dry-run opportunities are hypotheticals, not positions. Do NOT write
-        # them to the trades table — that would make the exposure cache think
-        # they are open positions and trip the portfolio-Kelly halt on the
-        # next cycle. The cycle summary (scan_log) already captures the count.
+        # 2026-05-23 (revised): write paper trades to trades.db with
+        # paper_trade=1 — matches the Polymarket paper-trade pattern that's
+        # been in place since 5/02. The earlier comment here said "don't
+        # write to trades.db because exposure cache would trip" — that was
+        # wrong: _ensure_exposure_cache reads from Kalshi's live
+        # get_open_positions() API, not from trades.db. Real positions
+        # are what they say; trades.db is only the bot's local log.
+        #
+        # Benefits of this path over the previous separate paper_trades.db:
+        #   - Dashboard /api/positions naturally shows paper trades (no
+        #     extra route needed; visual tagging done in JS via paper_trade=1).
+        #   - reconcile.py naturally settles paper trades when their markets
+        #     resolve on Kalshi — same code path as real trades.
+        #   - load_open_positions() returns paper trades, so the held-set
+        #     dedups them on subsequent cycles. No more 4-markets-×-2-cycles
+        #     duplicate logging.
+        #   - risk.py / calibration.py already filter paper_trade=0 in
+        #     the right places (drawdown, daily P&L, calibration fit).
+        contracts = opp.get("contracts")
+        if not contracts:
+            size_usd = float(opp.get("recommended_size") or 0.0)
+            entry_price = float(opp.get("entry_price") or 0.0)
+            if entry_price > 0 and size_usd > 0:
+                contracts = max(1, int(size_usd / entry_price))
+            else:
+                contracts = 1
+
+        # Depth gate (2026-05-24): mirror the executor's live-book check so
+        # paper P&L isn't inflated by phantom fills on thin books. Fetch the
+        # live orderbook, cap contracts to what's actually fillable at the
+        # entry price. Skip entirely if depth is zero. Fail-open on any API
+        # error (log with original contracts + a "depth_unverified" note).
+        depth_note = ""
+        ticker_for_depth = opp.get("ticker", "")
+        entry_price_for_depth = float(opp.get("entry_price") or 0.0)
+        action_for_depth = opp.get("action", "")
+        if ticker_for_depth and entry_price_for_depth > 0:
+            try:
+                book = kalshi_client.get_orderbook(ticker_for_depth)
+                # For BUY NO we need sellers of NO = buyers of YES on the
+                # book. The depth callable mirrors executor._recompute_edge.
+                if action_for_depth == "BUY NO":
+                    depth_fn = book.get("yes_depth_at_price")
+                else:
+                    depth_fn = book.get("no_depth_at_price")
+                if callable(depth_fn):
+                    available = int(depth_fn(entry_price_for_depth))
+                    if available == 0:
+                        logging.info(
+                            "[MAIN] paper skip %s: zero depth at %.2f",
+                            ticker_for_depth, entry_price_for_depth,
+                        )
+                        return "skipped:paper_zero_depth"
+                    if available < contracts:
+                        logging.info(
+                            "[MAIN] paper %s: depth %d < wanted %d, capping",
+                            ticker_for_depth, available, contracts,
+                        )
+                        contracts = available
+            except Exception as e:
+                depth_note = "depth_unverified"
+                logging.warning(
+                    "[MAIN] paper depth check failed for %s (%s) — logging anyway",
+                    ticker_for_depth, e,
+                )
+
+        synthetic_fill = {
+            "filled": True,
+            "fill_price": opp.get("entry_price"),
+            "fill_count": contracts,
+            "mode": "paper:dry-run",
+            "notes": "paper_trade" + (f":{depth_note}" if depth_note else ""),
+        }
+        opp_with_paper_flag = {**opp, "paper_trade": 1, "contracts": contracts}
+        try:
+            storage.log_trade(opp_with_paper_flag, synthetic_fill)
+        except Exception as e:
+            logging.warning("[MAIN] paper-trade log failed: %s", e)
         return "dry-run"
 
     import executor

@@ -5,6 +5,465 @@ why, what's intentionally not done, what to watch.
 
 ---
 
+## 2026-07-07 — Umbrella snapshot + decisions contract wiring (read-only)
+
+**What:** Added `snapshot_emit.py`, `decision_emit.py` (path stub only), and
+`tests/test_audit_snapshot_emit_gate.py`. Snapshot maps persisted trades.db stats
+when readable; degrades to `STARTING_BANKROLL` when DB unavailable. Emits
+`data/state.json` with `killed=true`, `health=down`, FLOORED loop fields in
+`extra`, and honest `live_gate=disarmed`. Added `-e ../umbrella` to
+`requirements.txt`. Registered in `umbrella/dashboard/sources.json`.
+
+**Why:** Fleet dashboard needs a uniform read surface for paused bots; this bot
+is stopped/FLOORED and must not look active.
+
+**Intentionally NOT done:** No decision-event emission (bot not running); no
+cron hook; no changes to `src/main.py`, strategy, or executor paths.
+
+**What to watch:** If trades.db moves, update `config.DB_FILE` resolution only —
+snapshot_emit already reads via storage module.
+
+---
+
+## 2026-05-24 — Fix cross-bot interference + broken venv launch (ops)
+
+**Context:**
+Three local dashboards (this bot on :8082, pure_arb_bot on :8083,
+Multi_Agent_Asset_Competitive_Bot on :8081) appeared to "interfere" with
+each other — restarting one would take the others down. The ports were
+never actually in conflict.
+
+### What we found
+- This bot's services were being launched by hand with bare `python3`
+  (`nohup python3 src/main.py ...`) instead of `venv/bin/python`, so
+  flask/numpy were missing and `main.py` and `dashboard.py` exited
+  immediately with `ModuleNotFoundError`. Root cause of the missing modules:
+  the venv was built against Xcode's bundled Python 3.8.9
+  (`/Applications/Xcode.app/.../usr/bin/python3`), which is unstable across
+  Xcode updates; `venv/bin/python` no longer resolves to a working binary.
+- The hand-typed restart line used broad kill patterns:
+  `pkill -9 -f "src/main.py"; pkill -9 -f "observer"; pkill -9 -f "dashboard.py"`.
+  `pkill -f` matches the FULL command line of EVERY process, so
+  `dashboard.py` / `observer` also matched the OTHER bots' processes and
+  killed them. That cross-killing was the real "interference" (it showed up
+  as connection-refused tabs and graceful-shutdown signal cascades on the
+  Multi_Agent bot).
+
+### What we changed
+- Added `run.sh` ({start|stop|status}) that (a) always launches with
+  `venv/bin/python`, and (b) only ever kills processes whose working
+  directory is THIS bot's folder (cwd-scoped via `lsof -d cwd`), so it can
+  never touch the other bots.
+
+### Intentionally NOT done
+- Did not rebuild the venv automatically and did not start/stop the live
+  bot — these are live-capital services, so the venv rebuild is run by hand:
+  `python@3.11 -m venv venv && venv/bin/pip install -r requirements.txt`.
+
+### What to watch
+- After rebuilding the venv, `./run.sh start` should show no
+  `ModuleNotFoundError` in `logs/dashboard.log`, and :8082 should load.
+- Never reintroduce bare `pkill -f dashboard.py` / `observer` — always scope
+  kills to this bot's folder (run.sh does this).
+
+---
+
+## 2026-05-23 — Paper-trade persistence (live paper trading layer)
+
+**Context:**
+Phase A gates were shipped but the Phase 0 backtest had a structural
+limitation: it used each ticker's first observation as the trade price,
+not the cycle when the bot would actually trade. User flagged this and
+asked for a real-time paper trading layer before flipping live capital.
+
+The bot already supports `LIVE_TRADING_ENABLED=false` (returns "dry-run"
+without placing orders). What was missing: persistence of the dry-run
+decisions so they can be scored against real settlements.
+
+### What we found before fixes
+
+- Existing dry-run path (`src/main.py:535`) intentionally does NOT write
+  to `trades.db` — would trip the exposure cache into thinking they were
+  open positions and halt the bot on next cycle.
+- Cycle summary captures dry-run trade *counts* but not per-decision
+  detail. Zero ground truth for scoring.
+
+### What shipped
+
+1. **`src/paper_storage.py`** — new isolated DB at `data/paper_trades.db`
+   with two tables: `paper_trade` (decision-time data) and `paper_result`
+   (settlement-time data). Mirrors the trades/results schema split. Uses
+   the same autocommit + 30s-timeout locking pattern as the observer DBs.
+   `log_paper_trade(opp)` never raises — failures log a warning, bot
+   cycle continues.
+2. **`src/main.py:_process_directional`** — when LIVE_TRADING_ENABLED is
+   false and an opportunity passes all gates, calls
+   `paper_storage.log_paper_trade(opp, bankroll=...)`. Existing comment
+   about not writing to trades.db preserved + amended.
+3. **`scripts/score_paper_trades.py`** — read tool that joins paper_trade
+   rows to Kalshi `/markets/{ticker}` settlements, persists outcomes to
+   `paper_result`, reports aggregate + per-direction + per-city + per
+   cal_p band stats. Dedupes to FIRST paper trade per (ticker, venue)
+   to match what production held-position dedup would do.
+
+### Operational protocol for live paper trading
+
+Pre-flight (one-time):
+1. Stop bot if running.
+2. Update `.env`: prod URLs, prod KEY_ID, prod pem path.
+3. Run `venv/bin/python scripts/reset_performance.py` (NO --wipe-trades) —
+   stamps new prod venue signature on performance.json.
+4. Set `LIVE_TRADING_ENABLED=false` in `.env`.
+5. Start bot.
+
+Watch (continuous):
+- Bot will hit prod markets, evaluate Phase A gates, return "dry-run"
+  on passes, log each to paper_trades.db.
+- Run `venv/bin/python scripts/score_paper_trades.py` periodically to
+  see settlement-scored EV. Realistic to see first results within 24h
+  (markets that close overnight).
+
+Decision criteria for moving to live:
+- Hard test (after ≥30 settled paper trades): EV/contract > +$0.02.
+  If yes, flip LIVE_TRADING_ENABLED=true. If no, debug or pivot to v3.
+- Per-city sanity (after ≥10 trades/city for any high-volume city):
+  no city below −$0.05/contract.
+
+### Intentionally NOT done
+
+- **No paper-side held-position dedup.** The bot will re-log the same
+  ticker across cycles if it keeps passing gates. The scoring script
+  handles this by taking FIRST paper trade per ticker. Production
+  held-set dedup will kick in once we flip to live (reads from trades.db
+  which is unaffected by paper logging).
+- **No simulation of maker logic.** Paper trade entry_price is the
+  observed ask we'd pay as a taker. Real bot does maker-then-taker,
+  potentially filling at better prices. Conservative assumption.
+- **No adverse-selection modeling.** Treats every paper trade as if
+  it fills at observed ask. Real fills are subject to counterparty
+  selection. Paper EV is an upper bound on real-fill EV — by how much
+  is the open question only real capital can answer.
+
+### What to watch
+
+- First `[STRATEGY] rejections: ...` lines should show non-zero
+  `city_excluded` (PHX/LV being filtered).
+- `data/paper_trades.db` should grow as the bot finds Phase A-passing
+  trades — expect ~7/day from Phase 0 estimate, likely 5-15/day real.
+- First settled paper trades arrive ~24h after first cycle (overnight
+  east-coast city closes).
+- 17/17 kill-switch dry-run still passes.
+
+---
+
+## 2026-05-23 — Phase A gates shipped: BUY_YES_CAL_P_CAP=0.60, BUY_NO band, exclude PHX/LV
+
+**Context:**
+Phase 0 validation (n=1186 settled signals, ~234h) and per-city deep dive
+established the dominant signal: direction asymmetry, not city. BUY YES
+catastrophic at high cal_p across all cities; BUY NO EV-positive in a
+narrow cal_p band; PHX/LV specifically broken (0/15 confident YES).
+
+Tried two paths in parallel:
+- **Path 1** — hand-tuned gates (BUY NO cal_p∈[0.15,0.30), BUY YES cap 0.60,
+  exclude PHX/LV). Full-cohort backtest: 70 trades, 53% wins, EV
+  +$0.034/contract, cohort total +$2.39 over 234h.
+- **Path 2** — isotonic refit on n=948 train cohort, eval on n=238 test.
+  Failed: isotonic's monotonic constraint can't represent our model's
+  *inverted* high-confidence signal (model says 0.85, actual is 0.10).
+  Plateau at cal_p=0.265 for all raw_p ≥ 0.30 means broken BUY YES
+  trades still triggered. Net EV/contract −$0.04.
+
+### Why Path 1 worked and Path 2 didn't
+
+Isotonic regression preserves monotonicity. Our model's raw_p in [0.5, 1.0]
+maps to *lower* empirical yes-rates than raw_p in [0.2, 0.3] — the
+relationship is non-monotonic. The best monotonic fit pools the entire
+high-raw_p range to a single value (0.265), which doesn't kill the broken
+regime; the bot would still pick BUY YES at edge=0.265−yes_ask. Phase 1's
+hard cal_p cap is the right shape for the underlying signal.
+
+### What shipped
+
+1. **`src/config.py`** — new constants with documented derivation:
+   - `BUY_YES_CAL_P_CAP = 0.60` (tightened from previous `>=0.85` guard)
+   - `BUY_NO_CAL_P_LO = 0.15`
+   - `BUY_NO_CAL_P_HI = 0.30`
+   - `EXCLUDE_CITIES = frozenset({"Phoenix", "Las Vegas"})`
+   - Multi-paragraph comment block preserves the per-cal_p-band EV
+     stratification and Path 1 backtest results.
+
+2. **`src/strategy.py:find_opportunities`** — three gate additions:
+   - Early skip + `rej["city_excluded"]` counter when city in
+     `EXCLUDE_CITIES`. Observer continues collecting these cities for
+     ongoing measurement; trading skips them.
+   - `yes_filtered` now uses `BUY_YES_CAL_P_CAP` (was hard-coded 0.85).
+   - `no_filtered` adds the cal_p band check on top of the existing
+     5/03 disagreement guard.
+
+3. **Phase 0 validation scripts retained** in `scripts/` for repeat
+   evaluation: `validate_phase_a_gates.py`, `phase_0_revised.py`,
+   `per_city_deep_dive.py`, `deep_analysis_20260517.py`.
+
+### Kill-switch dry-run: 17/17 pass with new gates.
+
+### Intentionally NOT done
+
+- **No isotonic calibration ship.** The fit doesn't help — non-monotonic
+  signal can't be repaired by monotonic regression. Revisit only when
+  v3 fixes the underlying model (METAR/HRRR), at which point isotonic
+  on the v3 forecaster's output is a different problem.
+- **No watch-list city exclusion yet.** Oklahoma City, New Orleans, and
+  Philadelphia showed negative BUY-NO EV in shadow data but tiny n
+  (3-4 trades). Don't pre-emptively exclude; add to EXCLUDE_CITIES if
+  real-fill EV confirms negative over n≥10.
+- **No bankroll/sizing changes.** $25 bankroll + 5% per-trade cap +
+  MIN_POSITION=$0.50 floor produces ~1-contract trades, which is
+  appropriate for the validation cohort.
+- **No live trading yet.** Phase A is the *pre-flip* hardening. The
+  flip (Phase B) is a separate explicit decision.
+
+### What to watch (post-flip, when Phase B runs)
+
+- `[STRATEGY] rejections: ... city_excluded=N` should be non-zero on
+  every cycle (PHX/LV are always in the universe; just rejected from
+  trading).
+- First 20 fills: target EV/contract > 0 cumulative. If < −$0.05,
+  halt and review.
+- First 50 fills: per-city EV — if OKC/NOLA/PHIL show real negative
+  EV, add to `EXCLUDE_CITIES`.
+- `cal_p` distribution of fills should cluster in [0.15, 0.30) for
+  BUY_NO and rarely exceed 0.60 for BUY_YES. If the bot is making
+  trades outside these ranges, the gates aren't wired right.
+
+---
+
+## 2026-05-23 — Per-city deep dive: direction is the signal, not city
+
+**Context:**
+After two weeks of shadow-audit data (n=1177 settled signals), surface-level
+metrics showed Boston near-parity (Brier ratio 1.06×) and Phoenix/Las Vegas
+catastrophic (2.34-2.42×). User asked to investigate the surprising numbers
+before acting on them. The dig produced a sharper read.
+
+### What we found
+
+- **The Boston near-parity was sample-size noise.** Bootstrap 90% CI on
+  Boston's Brier ratio is [0.84, 1.32]; only 37% of resamples show
+  model ≤ market. n=68 is not enough to claim city-restricted edge.
+- **The catastrophic cities aren't bad because the climate is hard —
+  they're bad because the market is unusually sharp there.** Phoenix
+  market Brier = 0.095 (best in cohort) vs 0.135 in Boston. The PHX/LV
+  T-ticker market Brier is **0.003** — questions like "will PHX exceed
+  105°F in May?" are essentially decided at listing.
+- **The dominant signal is direction, not city.** When the model is
+  confident BUY NO (`cal_p < 0.3`), it's right 75-79% of the time
+  across virtually every city. When it's confident BUY YES (`cal_p ≥
+  0.7`), it's right ~13% globally — **0/15** in PHX+LV combined.
+- **LAX has the OPPOSITE bias from the global pattern.** 10/12 LAX
+  confident-wrong markets had cal_p low / outcome YES (model said
+  cool, day was hot). Likely marine-layer dynamics confusing GEFS into
+  averaging cool-morning + warm-offshore conditions into a too-cool
+  forecast. Most other cities don't show this; PHX/LV show the opposite
+  direction (too-warm confident YES).
+- **Spread inflation worked partially (1.43× → 1.33× ratio, n=657/520
+  pre/post).** Fixed the confident-NO band calibration cleanly (gap
+  +0.054 → +0.017 in [0.0, 0.1) cal_p) but only modestly improved the
+  confident-YES tail. The remaining BUY-YES failures are structural,
+  not pure under-dispersion.
+
+### Tools shipped
+
+- `scripts/deep_analysis_20260517.py` — comprehensive multi-section
+  analysis: pre/post inflation calibration, per-city decomp, lead time,
+  GEFS run age, realized vs predicted dispersion, METAR overlap,
+  outlier markets.
+- `scripts/per_city_deep_dive.py` — per-city Brier with bootstrap CIs,
+  base-rate normalization, cal_p decisiveness, direction-of-failure
+  breakdown, Boston/PHX/LV/LAX targeted analyses.
+
+### Intentionally NOT done
+
+- No live trading yet. The findings justify a flip but only with
+  pre-flip hardening (next ledger entry).
+- No per-city CLI_BIAS refit. LAX cool-bias hypothesis exists but n=12
+  outliers isn't sufficient evidence for a load-bearing per-city shift.
+  Would need ≥30 confident-wrong LAX markets to refit confidently.
+- No PHX/LV exclusion from trade universe. Without confident-YES
+  enabled, PHX/LV harm vanishes — the city restriction was solving
+  the wrong problem.
+
+### What to watch
+
+- The asymmetric MIN_EDGE + cal_p cap (next ledger entry) should make
+  ~all of the historical confident-YES failures filter out. Validate
+  retroactively against the n=1177 cohort before flipping.
+- LAX direction-of-failure persists in fresh data: if next 20 LAX
+  confident-wrong are still mostly "model cool, day hot," that's a real
+  city-specific bias and would justify a per-city correction.
+
+---
+
+## 2026-05-17 — Diagnosis revision: under-dispersion, spread inflation, METAR collection
+
+**Context:**
+First two weeks of v3 shadow audit showed v2 model Brier ratio stuck at
+1.40-1.43× vs market across n=55→700, with strong-disagreement model
+win rate locked at 24-27%. Initial hypothesis was GEFS warm bias; this
+was tested and refuted.
+
+### What we found
+
+- **GEFS is NOT warm-biased.** Direct measurement of GEFS forecast vs
+  CLI settlement across n=108 events: mean −0.44°F (essentially zero),
+  median 0.00°F, stdev 2.23°F. The original `cli_gap_audit.py`
+  measured CLI-vs-ASOS gap (~+0.6°F) and applied it as a GEFS shift
+  on the untested assumption "GEFS is ASOS-aligned." That assumption
+  was wrong.
+- **The real failure mode is ensemble under-dispersion.** Predicted
+  GEFS ensemble SD median 1.43°F (n=168 fresh signals); realized
+  forecast error stdev 2.23°F. Ratio 0.64× → actual forecast
+  uncertainty is ~1.55× wider than GEFS suggests. The calibration
+  bucket signature (both ends biased away from 0.5) is the classic
+  under-dispersion fingerprint.
+- **CLI_BIAS correction was making things worse for cities that
+  didn't need it.** Original values shifted forecasts up +0.5-1.0°F
+  uniformly; actual mean bias is ~0. Zeroed across all cities.
+
+### Fixes shipped
+
+1. **`CLI_BIAS = 0.0` for all 19 cities** in `src/config.py`. Comment
+   preserves measurement history and rationale.
+2. **`SPREAD_INFLATION_FACTOR = 1.55`** in `src/config.py`, applied in
+   `forecast.get_ensemble_high()` after CLI_BIAS, before bracket
+   probability calc. Each member moves radially outward from ensemble
+   mean: `m' = mean + (m - mean) * 1.55`. Mathematically principled
+   correction for under-dispersion.
+3. **`compute_market_cal_p_full()`** added to `strategy.py` — returns
+   dict with cal_p, raw_p, ensemble_mean, ensemble_sd, ensemble_n.
+   Original `compute_market_cal_p()` preserved as thin wrapper.
+4. **Shadow logger schema migrated** with `ensemble_mean`, `ensemble_sd`,
+   `ensemble_n`, `raw_p` columns via `_apply_additive_columns()`
+   (idempotent ALTER TABLE).
+5. **`scripts/metar_logger.py`** — new passive daemon, ~15min cycle,
+   pulls hourly NWS METAR observations for all 19 city airports into
+   `data/metar_observations.db`. NOT used by the model — prep for
+   Checkpoint 1. All 19 stations validated on first run.
+6. **Hardened `phase2_shadow_logger.py`** with 2-tuple timeouts,
+   broader exception catching, persistent session, and a 600s
+   wall-clock alarm. Survives network drops cleanly; outer
+   `while-true; sleep 3600` loop retries an hour later. Added after
+   the 5/12 silent-hang incident during the user's commute.
+7. **Locking fix**: shadow logger and poly_observer switched to
+   autocommit mode + 30s timeout. Eliminates "database is locked"
+   errors when shadow's loop overlaps with kalshi observer writes.
+8. **`scripts/run_all_observers.py`** updated to spawn METAR as a
+   fourth subprocess. One-terminal management for all four collectors.
+
+### Intentionally NOT done
+
+- **No per-city `SPREAD_INFLATION_FACTOR`** despite suggestive per-city
+  variation in measured bias. Per-city sample sizes (n=4-7) too small
+  to fit reliably. Refit when n ≥ 30/city.
+- **No auto-tuning of the inflation factor.** TODO in `config.py`
+  points at a future `scripts/fit_spread_inflation.py`; manual refit
+  cadence weekly→monthly. Auto-adjusted load-bearing parameters are
+  hard to reason about.
+- **No `ensemble_kurtosis` or higher moments** in shadow_signal. The
+  ratio of predicted-to-realized SD is the dominant signal; higher
+  moments would be fitting noise at current sample sizes.
+
+### What to watch
+
+- Brier ratio change between pre- and post-inflation cohorts as the
+  post cohort grows. Initial measurement at small post-n showed
+  1.43× → 1.33× — promising but small sample.
+- Calibration buckets — [0.0, 0.1) gap should drop toward 0 (it did,
+  from +0.054 to +0.017). [0.7, 1.0) gap should also compress (it
+  partially did but remains the dominant failure mode).
+- METAR DB row count should grow ~600/hr (≈30 obs/hr × 19 stations).
+  If it stops growing, NWS API may have changed.
+
+---
+
+## 2026-05-10 — Shadow audit infrastructure (prod observer, Phase 2 logger, harm-reduction)
+
+**Context:**
+2026-05-10 demo-vs-prod audit revealed Kalshi demo is not a faithful prod
+mirror — different tick grid, 4× wider spreads, 100-1000× thinner depth,
+prices uncoupled from real weather. The 5/9 "model broadly miscalibrated"
+edge investigation was retroactively invalidated (cohort was demo-priced
+counterparties not pricing weather at all). Decision: build shadow audit
+infrastructure to measure forecast quality against PROD prices before any
+capital flips.
+
+### What we found before fixes
+
+- **Demo→prod divergence.** Demo tick grid is `tapered_deci_cent`; prod is
+  `linear_cent`. Demo spreads ~15c; prod 1-3c. Demo top-of-book depth
+  often 1-5 contracts; prod typically 50-500+. Most damningly, demo
+  prices don't move with real weather — they wander based on demo-counterparty
+  positioning.
+- **Halt thresholds were demo-era.** Calibrated assuming losses didn't
+  matter. Tightened ahead of prod flip.
+- **No measurement framework existed.** v2 had no way to know whether the
+  model had forecast edge against prod prices without flipping live and
+  risking capital — exactly the v1 mistake.
+
+### Fixes shipped
+
+1. **`scripts/prod_observer.py`** — 5-min cadence scraper of Kalshi PROD
+   public order books. Writes to `data/prod_observer.db` (separate from
+   trades.db; WAL mode for concurrent reader access). 4-worker parallel
+   discovery + per-series book fetch. SIGINT-clean shutdown.
+2. **`scripts/phase2_shadow_logger.py`** — hourly logger of model
+   forecasts paired with prod book prices. New `shadow_signal` table.
+   **Discipline:** logs `calibrated_p` + `prod_yes_mid` only. NO synthetic
+   P&L column. Joinable to settlement outcomes for forecast-Brier.
+3. **`scripts/market_calibration.py`** — analysis tool that joins
+   settled markets to observed book prices to measure how informed
+   prod pricing is. First finding: market Brier ~0.08 across n=114 settled
+   markets — prod is sharply informed.
+4. **`scripts/kill_switch_dry_run.py`** — exercises every halt/cap
+   against a tempdir performance.json. 17 distinct checks. Re-run
+   after any risk.py edit, immediately before any live flip.
+5. **`scripts/reset_performance.py`** with `--wipe-trades` flag — archives
+   trades.db at demo→prod flip since the existing `venue` column only
+   distinguishes Kalshi/Polymarket, not demo-Kalshi/prod-Kalshi.
+6. **Venue-signature fail-closed safety** in `src/risk.py`. Bot startup
+   refuses to boot if stored sig ≠ current env sig — catches accidental
+   demo↔prod credential swap before peak_bankroll baseline is corrupted.
+7. **Tightened halt thresholds** in `src/config.py`:
+   - `MAX_DRAWDOWN_PCT` 33% → 25%
+   - `MAX_SINGLE_BET_PCT` 5% → 2.5% (later reverted 5/11 to 5% after
+     contract-granularity issue surfaced; see config comment)
+   - `DAILY_LOSS_LIMIT_PCT` 20% → 15%
+   - `MIN_POSITION` 1.00 → 0.50 (so absolute floor never overrides %
+     cap at small bankroll)
+8. **`scripts/poly_observer.py`** — Polymarket cross-venue observer
+   built 5-11. Combined observer + shadow logger. First-cycle finding:
+   23/44 Polymarket weather markets have empty NO-token book; rest
+   show ~100c cross-token spreads. Polymarket weather is essentially
+   non-trade-able for our strategy — not a viable second venue.
+
+### Intentionally NOT done
+
+- **No live trading.** Bot stays on demo while shadow data accumulates.
+- **No HRRR/METAR ingest yet.** Deferred to v3 plan. Phase 2 logger
+  measures the gap that ingesting these would close.
+- **No model changes during this phase.** Don't bundle architecture
+  changes with measurement infrastructure.
+
+### What to watch
+
+- Daily counts of `book_snapshot` rows (target ~5000/day) and
+  `shadow_signal` rows (target ~150/run × 24 runs/day = ~3600/day).
+- `data/prod_observer.db` size growth. WAL files are gitignored.
+- First settled cohort scoring — wait for n ≥ 50 settled before
+  drawing conclusions.
+
+---
+
 ## 2026-05-09 — Post-bleed audit: spread gate, Wilson sizing, halt visibility, drawdown reset
 
 **Context:**

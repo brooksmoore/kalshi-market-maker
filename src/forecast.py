@@ -34,7 +34,7 @@ from datetime import date, timedelta
 
 import requests
 
-from config import CITIES, CITY_TZ, CLI_BIAS
+from config import CITIES, CITY_TZ, CLI_BIAS, SPREAD_INFLATION_FACTOR
 
 OPEN_METEO_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 ENSEMBLE_MODEL = "gfs_seamless"  # Open-Meteo GEFS-seamless = 1 control + 30 members
@@ -139,6 +139,21 @@ def get_ensemble_high(city: str, target_date: date) -> list[float]:
         members = [m + bias for m in members]
         logging.debug("[FORECAST] %s: applied CLI bias +%.2f°F to %d members",
                       city, bias, len(members))
+
+    # Ensemble spread inflation (shipped 2026-05-17, see config.SPREAD_INFLATION_FACTOR
+    # for measurement rationale). Inflates each member radially around the
+    # ensemble mean to correct for GEFS under-dispersion. Mathematically:
+    # the bracket probabilities downstream now reflect the realized forecast
+    # error variance (~2.23°F) rather than GEFS's artificially tight spread
+    # (~1.43°F). Cheap, principled, addresses the dominant v2 failure mode.
+    if SPREAD_INFLATION_FACTOR != 1.0 and len(members) >= 2:
+        ens_mean = sum(members) / len(members)
+        members = [
+            ens_mean + (m - ens_mean) * SPREAD_INFLATION_FACTOR
+            for m in members
+        ]
+        logging.debug("[FORECAST] %s: inflated ensemble spread by %.2fx (n=%d)",
+                      city, SPREAD_INFLATION_FACTOR, len(members))
 
     _cache_put(city, target_date, members)
     return members

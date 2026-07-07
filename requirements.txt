@@ -7,3 +7,4 @@ anthropic>=0.18
 cryptography>=40.0,<42.0
 pytest>=7.0
 flask>=2.0,<3.0
+-e ../umbrella

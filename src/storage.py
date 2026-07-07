@@ -42,14 +42,18 @@ NOTES_VALID_SQL = (
     "(t.notes IS NULL OR ("
     "t.notes NOT LIKE 'invalid:%' "
     "AND t.notes NOT LIKE 'void:%' "
-    "AND t.notes NOT LIKE 'ghost-%'))"
+    "AND t.notes NOT LIKE 'ghost-%' "
+    "AND t.notes NOT LIKE 'DUPE_EXCLUDED%' "
+    "AND t.notes NOT LIKE 'EXCLUDED_UNVERIFIABLE%'))"
 )
 NOTES_VALID_LIVE_SQL = (
     "(t.notes IS NULL OR ("
     "t.notes NOT LIKE 'invalid:%' "
     "AND t.notes NOT LIKE 'void:%' "
     "AND t.notes NOT LIKE 'ghost-%' "
-    "AND t.notes != 'dry-run'))"
+    "AND t.notes != 'dry-run' "
+    "AND t.notes NOT LIKE 'DUPE_EXCLUDED%' "
+    "AND t.notes NOT LIKE 'EXCLUDED_UNVERIFIABLE%'))"
 )
 NON_DRYRUN_SQL = "(t.mode IS NULL OR t.mode != 'dry-run')"
 NON_ARB_SQL = "(t.market_type IS NULL OR t.market_type != 'arbitrage')"

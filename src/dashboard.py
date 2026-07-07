@@ -95,6 +95,75 @@ def _kalshi_balance() -> tuple[float, float, float]:
         return result
 
 
+_bot_mtm_cache: dict = {}
+_bot_mtm_lock = threading.Lock()
+
+def _bot_mark_to_market(
+    open_rows: list[tuple],
+) -> tuple[float, float, float]:
+    """Return (bot_unrealized_pnl, bot_position_value, bot_deployed) scoped
+    only to bot-originated open positions (the rows from trades LEFT JOIN
+    results WHERE r.id IS NULL). Prices fetched from Kalshi orderbook and
+    cached for 120s to avoid hammering the API on every dashboard refresh.
+
+    Falls back gracefully: positions with no book data are valued at cost
+    (entry_price * contracts) — no unrealized P&L contribution.
+
+    Args:
+        open_rows: list of (ticker, action, entry_price, contracts, size_usd)
+    """
+    import time
+    with _bot_mtm_lock:
+        cached_ts = _bot_mtm_cache.get("ts", 0)
+        cached_rows_key = _bot_mtm_cache.get("rows_key", None)
+        rows_key = tuple((r[0], r[1]) for r in open_rows)  # (ticker, action) fingerprint
+        if cached_ts > time.time() - 120 and cached_rows_key == rows_key:
+            return _bot_mtm_cache["v"]
+
+        unrealized = 0.0
+        pos_value = 0.0
+        deployed = 0.0
+        try:
+            import kalshi_client
+        except Exception:
+            kalshi_client = None  # type: ignore
+
+        for ticker, action, entry_price, contracts, size_usd in open_rows:
+            ep = float(entry_price or 0)
+            qty = int(contracts or 0)
+            cost = float(size_usd or ep * qty)
+            deployed += cost
+
+            current_price = None
+            if kalshi_client is not None:
+                try:
+                    book = kalshi_client.get_orderbook(ticker)
+                    bya = book.get("best_yes_ask")  # cheapest YES to buy
+                    bna = book.get("best_no_ask")   # cheapest NO to buy
+                    # Mark at bid (conservative): what we could sell it for.
+                    # BUY NO bid  = 1 - best_yes_ask
+                    # BUY YES bid = 1 - best_no_ask
+                    if action == "BUY NO" and bya is not None:
+                        current_price = round(1.0 - bya, 4)
+                    elif action == "BUY YES" and bna is not None:
+                        current_price = round(1.0 - bna, 4)
+                except Exception:
+                    pass
+
+            if current_price is not None:
+                pos_value += current_price * qty
+                unrealized += (current_price - ep) * qty
+            else:
+                # No book data — value at cost; no unrealized contribution.
+                pos_value += cost
+
+        result = (unrealized, pos_value, deployed)
+        _bot_mtm_cache["ts"] = time.time()
+        _bot_mtm_cache["rows_key"] = rows_key
+        _bot_mtm_cache["v"] = result
+        return result
+
+
 def _latest_scan_halt_state() -> tuple[bool, list[str], bool]:
     """Read halt state from the most recent scan_log row.
 
@@ -193,7 +262,7 @@ def _db_query(sql: str, params: tuple = ()) -> list[tuple]:
 @app.route("/api/kpis")
 def api_kpis():
     perf = _read_perf()
-    live_bankroll = float(perf.get("bankroll", STARTING_BANKROLL))
+    kalshi_account_balance = float(perf.get("bankroll", STARTING_BANKROLL))
     peak = float(perf.get("peak_pnl", 0.0))
     starting = float(perf.get("starting_bankroll", STARTING_BANKROLL))
     realized_rows = _db_query(f"""
@@ -203,33 +272,36 @@ def api_kpis():
           AND {NOTES_VALID_LIVE_SQL}
     """)
     realized_pnl = float(realized_rows[0][0]) if realized_rows else 0.0
-    # Headline bankroll = the live Kalshi snapshot, so the dashboard agrees
-    # with what the venue actually shows. Manual top-ups and withdrawals
-    # are part of bankroll but explicitly NOT part of total_pnl, which is
-    # sourced only from resolved trades.
-    bankroll = live_bankroll
     total_pnl = realized_pnl
-    db_bankroll = starting + realized_pnl  # what bankroll would be sans deposits
-    peak_bankroll = max(bankroll, starting + peak)
-    unrealized_pnl = live_bankroll - db_bankroll
 
-    # Count unique held positions, not raw fill rows. The same ticker+side
-    # can have many trade rows (e.g. retries during demo lag, or the bot
-    # firing the same opp across cycles), but the user thinks of each
-    # ticker+side combination as one position — same as Kalshi's UI.
-    open_rows = _db_query(f"""
-        SELECT COALESCE(SUM(t.size_usd), 0.0),
-               COUNT(DISTINCT t.ticker || '|' || COALESCE(t.action, ''))
+    # Bot-scoped open positions: fetch tickers/actions for MTM pricing.
+    # We separate the position list query (returns all columns needed for
+    # MTM) from the count/sum-only query used for open_count.
+    mtm_rows = _db_query(f"""
+        SELECT t.ticker, t.action, t.entry_price, t.contracts, t.size_usd
         FROM trades t LEFT JOIN results r ON r.trade_id = t.id
         WHERE r.id IS NULL
           AND {NON_DRYRUN_SQL}
           AND {NOTES_VALID_LIVE_SQL}
     """)
-    open_count = int(open_rows[0][1]) if open_rows else 0
-    kalshi_cash, position_value, total_balance = _kalshi_balance()
-    cash = kalshi_cash if total_balance > 0 else max(0.0, bankroll)
-    deployed_pct = position_value / total_balance if total_balance > 0 else 0.0
+    open_count = len(set((r[0], r[1]) for r in mtm_rows))  # unique ticker|action pairs
+
+    # Mark open bot positions to market via Kalshi orderbook (120s cache).
+    # bot_bankroll is the counterfactual: what the account would be if only
+    # bot trades had occurred. Decoupled from manual trades and deposits.
+    bot_unrealized_pnl, bot_position_value, bot_deployed = _bot_mark_to_market(mtm_rows)
+    bankroll = starting + realized_pnl + bot_unrealized_pnl
+    unrealized_pnl = bot_unrealized_pnl
+    position_value = bot_position_value
+    peak_bankroll = max(bankroll, starting + peak)
+    deployed_pct = bot_deployed / bankroll if bankroll > 0 else 0.0
     drawdown_pct = (peak_bankroll - bankroll) / peak_bankroll if peak_bankroll > 0 else 0.0
+
+    # Cash: bot-scoped estimate. We use Kalshi API cash only as a reference
+    # (it reflects manual trades too). Bot-scoped cash = bot_bankroll minus
+    # what the bot has deployed at cost.
+    kalshi_cash, _kpos_val, _ktotal = _kalshi_balance()
+    cash = max(0.0, bankroll - bot_deployed)
 
     # Today P&L = real trading activity that resolved today.
     # Excludes 'dry-run' (never real) and 'backfill' (historical
@@ -241,6 +313,7 @@ def api_kpis():
         FROM results r JOIN trades t ON r.trade_id = t.id
         WHERE DATE(r.resolved_at) = DATE('now', 'localtime')
           AND (t.mode IS NULL OR t.mode NOT IN ('dry-run', 'backfill'))
+          AND (t.notes IS NULL OR (t.notes NOT LIKE 'DUPE_EXCLUDED%' AND t.notes NOT LIKE 'EXCLUDED_UNVERIFIABLE%'))
     """)
     today_pnl = float(today_rows[0][0]) if today_rows else 0.0
 
@@ -270,6 +343,40 @@ def api_kpis():
     nonarb_wins = yes_wins + no_wins
     yes_win_rate = round(yes_wins / yes_total * 100, 1) if yes_total > 0 else None
     no_win_rate = round(no_wins / no_total * 100, 1) if no_total > 0 else None
+
+    # Breakeven win rate = contract-weighted avg entry price. In a binary
+    # market you risk `entry_price` to win $1, so you must win > entry_price
+    # fraction of the contracts just to break even.
+    #
+    # CRITICAL: the comparison must be CONTRACT-WEIGHTED on both sides, not
+    # per-trade win rate vs contract-weighted price. Algebra:
+    #   EV/contract = (contract_weighted_win_rate) - (avg_entry_price)
+    # exactly. Using per-trade win rate here overstates edge whenever cheap
+    # high-edge trades lose more often than expensive favorites (which is
+    # exactly our pattern) — a Simpson's-paradox trap. So win_rate_edge below
+    # equals EV/contract * 100 by construction, and is the honest number.
+    be_rows = _db_query(f"""
+        SELECT COALESCE(SUM(t.entry_price * t.contracts), 0.0),
+               COALESCE(SUM(t.contracts), 0),
+               COALESCE(SUM(CASE WHEN r.profit_loss > 0 THEN t.contracts ELSE 0 END), 0)
+        FROM trades t JOIN results r ON r.trade_id = t.id
+        WHERE {NON_DRYRUN_SQL}
+          AND {NON_ARB_SQL}
+          AND {NOTES_VALID_LIVE_SQL}
+    """)
+    be_cost = float(be_rows[0][0]) if be_rows else 0.0
+    be_qty = int(be_rows[0][1]) if be_rows else 0
+    be_win_qty = int(be_rows[0][2]) if be_rows else 0
+    breakeven_win_rate = round(be_cost / be_qty * 100, 1) if be_qty > 0 else None
+    # Contract-weighted win rate (matches EV units). Also expose the
+    # per-trade rate separately so the difference is visible, not hidden.
+    cw_win_rate = round(be_win_qty / be_qty * 100, 1) if be_qty > 0 else None
+    nonarb_win_rate = round(nonarb_wins / nonarb_resolved * 100, 1) if nonarb_resolved > 0 else None
+    win_rate_edge = (
+        round(cw_win_rate - breakeven_win_rate, 1)
+        if (cw_win_rate is not None and breakeven_win_rate is not None)
+        else None
+    )
 
     # Win rate / P&L by execution mode (maker vs taker) — also excludes arbs.
     mode_rows = _db_query(f"""
@@ -330,7 +437,7 @@ def api_kpis():
 
     return jsonify({
         "bankroll": round(bankroll, 2),
-        "live_bankroll": round(live_bankroll, 2),
+        "kalshi_account_balance": round(kalshi_account_balance, 2),
         "unrealized_pnl": round(unrealized_pnl, 2),
         "starting_bankroll": round(starting, 2),
         "total_pnl": round(total_pnl, 2),
@@ -356,6 +463,10 @@ def api_kpis():
         "win_rate": win_rate,
         "total_trades": total_trades,
         "wins": wins,
+        "breakeven_win_rate": breakeven_win_rate,
+        "directional_win_rate": nonarb_win_rate,
+        "cw_win_rate": cw_win_rate,
+        "win_rate_edge": win_rate_edge,
         "yes_win_rate": yes_win_rate,
         "yes_total": yes_total,
         "yes_wins": yes_wins,
@@ -395,7 +506,7 @@ def api_positions():
         SELECT t.id, t.ticker, t.city, t.action, t.entry_price, t.contracts,
                t.size_usd, t.ensemble_p, t.calibrated_p, t.edge_at_entry,
                t.mode, t.opened_at, t.target_settlement,
-               t.market_type, t.notes
+               t.market_type, t.notes, COALESCE(t.paper_trade, 0)
         FROM trades t LEFT JOIN results r ON r.trade_id = t.id
         WHERE r.id IS NULL
           AND {NON_DRYRUN_SQL}
@@ -440,9 +551,10 @@ def api_positions():
     for r in rows:
         (rid, ticker, city, action, entry_price, contracts, size_usd,
          ensemble_p, calibrated_p, edge_at_entry, mode, opened_at,
-         target_settle, market_type, notes_raw) = r
+         target_settle, market_type, notes_raw, paper_trade) = r
         notes = notes_raw or ""
         is_arb = (market_type == "arbitrage")
+        is_paper = bool(paper_trade)
         secs = _secs_to_settle(target_settle, ticker)
 
         if is_arb:
@@ -458,6 +570,7 @@ def api_positions():
                 "calibrated_p": calibrated_p, "edge_at_entry": edge_at_entry,
                 "mode": mode, "opened_at": opened_at,
                 "market_type": market_type, "is_arb": True, "arb_id": arb_id,
+                "is_paper": is_paper,
                 "secs_to_settle": round(secs) if secs is not None else None,
                 "fill_count": 1,
             })
@@ -480,6 +593,7 @@ def api_positions():
                 "opened_at": opened_at,  # min, set below
                 "market_type": market_type,
                 "is_arb": False, "arb_id": None,
+                "is_paper": is_paper,
                 "secs_to_settle": round(secs) if secs is not None else None,
                 "fill_count": 1,
             }
@@ -575,6 +689,7 @@ def api_trades():
         FROM trades t JOIN results r ON r.trade_id = t.id
         WHERE (t.mode IS NULL OR t.mode != 'dry-run')
           AND (t.market_type IS NULL OR t.market_type != 'arbitrage')
+          AND (t.notes IS NULL OR (t.notes NOT LIKE 'DUPE_EXCLUDED%' AND t.notes NOT LIKE 'EXCLUDED_UNVERIFIABLE%'))
         ORDER BY r.resolved_at DESC
         LIMIT 200
     """)
@@ -734,6 +849,7 @@ def api_analytics():
         FROM results r JOIN trades t ON r.trade_id = t.id
         WHERE (t.mode IS NULL OR t.mode != 'dry-run')
           AND DATE(r.resolved_at) >= DATE('now', '-30 days')
+          AND (t.notes IS NULL OR (t.notes NOT LIKE 'DUPE_EXCLUDED%' AND t.notes NOT LIKE 'EXCLUDED_UNVERIFIABLE%'))
         GROUP BY day
         ORDER BY day ASC
     """)
@@ -754,6 +870,7 @@ def api_analytics():
         WHERE t.city IS NOT NULL AND t.city != ''
           AND (t.mode IS NULL OR t.mode != 'dry-run')
           AND (t.market_type IS NULL OR t.market_type != 'arbitrage')
+          AND (t.notes IS NULL OR (t.notes NOT LIKE 'DUPE_EXCLUDED%' AND t.notes NOT LIKE 'EXCLUDED_UNVERIFIABLE%'))
         GROUP BY t.city
     """)
     by_city = {
@@ -995,6 +1112,7 @@ _HTML = """<!doctype html>
   .pill-maker { background:#1f2e3a; color:#79c0ff; }
   .pill-taker { background:#3a2e1f; color:#d29922; }
   .pill-arb   { background:#2e1f3a; color:#c792ea; }
+  .pill-paper { background:#3a3a1f; color:#e6d77a; border:1px dashed #e6d77a; }
   .chart-wrap { background:#151924; border-radius:8px; padding:16px;
                 border:1px solid #242a3a; }
   .chart-wrap canvas { max-height: 300px; }
@@ -1156,9 +1274,10 @@ async function refreshKPIs() {
     : '—';
 
   document.getElementById('kpis').innerHTML = `
-    <div class="kpi"><div class="label">Bankroll</div>
+    <div class="kpi"><div class="label">Bot P&L equity</div>
       <div class="value">${fmtUsd(k.bankroll)}</div>
-      <div class="delta ${pnlClass}">${k.total_pnl >= 0 ? '+' : ''}${fmtUsd(k.total_pnl)} all-time</div>
+      <div class="delta ${pnlClass}">${k.total_pnl >= 0 ? '+' : ''}${fmtUsd(k.total_pnl)} realized · ${k.unrealized_pnl >= 0 ? '+' : ''}${fmtUsd(k.unrealized_pnl)} open</div>
+      <div class="delta muted">Kalshi acct: ${fmtUsd(k.kalshi_account_balance)} (incl. manual trades)</div>
     </div>
     <div class="kpi"><div class="label">Today's P&L</div>
       <div class="value ${todayClass}">${k.today_pnl >= 0 ? '+' : ''}${fmtUsd(k.today_pnl)}</div>
@@ -1170,6 +1289,11 @@ async function refreshKPIs() {
     <div class="kpi"><div class="label">Total win rate <span class="muted" style="font-size:0.7em;">(arb groups bundled as 1)</span></div>
       <div class="value ${wrClass}">${wrStr}</div>
       <div class="delta muted">${k.wins} / ${k.total_trades} resolved</div>
+    </div>
+    <div class="kpi"><div class="label">Win rate vs breakeven <span class="muted" style="font-size:0.7em;">(contract-weighted = EV/contract)</span></div>
+      <div class="value ${k.win_rate_edge === null ? '' : (k.win_rate_edge >= 0 ? 'green' : 'red')}">${k.win_rate_edge === null ? '—' : (k.win_rate_edge >= 0 ? '+' : '') + k.win_rate_edge.toFixed(1) + ' pts'}</div>
+      <div class="delta muted">${k.cw_win_rate !== null ? k.cw_win_rate.toFixed(1) : '—'}% cw-win vs ${k.breakeven_win_rate !== null ? k.breakeven_win_rate.toFixed(1) : '—'}% breakeven (avg entry $${k.breakeven_win_rate !== null ? (k.breakeven_win_rate/100).toFixed(2) : '—'})</div>
+      <div class="delta muted">per-trade win rate ${k.directional_win_rate !== null ? k.directional_win_rate.toFixed(1) : '—'}% — looks higher, but cheap trades lose more</div>
     </div>
     <div class="kpi"><div class="label">BUY YES win rate</div>
       <div class="value ${wrClassFor(k.yes_win_rate)}">${k.yes_win_rate !== null ? k.yes_win_rate.toFixed(1) + '%' : '—'}</div>
@@ -1223,7 +1347,9 @@ async function refreshPositions() {
     const actionPill = p.action === 'BUY YES'
       ? '<span class="pill pill-yes">YES</span>'
       : '<span class="pill pill-no">NO</span>';
-    const modePill = p.is_arb
+    const modePill = p.is_paper
+      ? '<span class="pill pill-paper" title="paper trade — LIVE_TRADING_ENABLED=false">PAPER</span>'
+      : p.is_arb
       ? '<span class="pill pill-arb" title="' + (p.arb_id || 'arb leg') + '">arb</span>'
       : p.mode === 'maker'
       ? '<span class="pill pill-maker">maker</span>'

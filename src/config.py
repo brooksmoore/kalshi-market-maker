@@ -60,13 +60,20 @@ STARTING_BANKROLL: float = 100.0     # $100 demo paper
 # established on prod — at that point larger sizing = more profit and
 # this throttle becomes a tax on proven edge.
 KELLY_FRACTION: float = 0.10
-# 2026-05-10: tightened from 5% → 2.5% ahead of prod transition. At a $200
-# prod starting bankroll, 2.5% = $5 max per trade (~10 contracts at $0.50,
-# ~5 at $0.95). Preserves Kelly's relative sizing across opportunities
-# while keeping per-trade blast radius tiny during the proof-of-concept
-# cohort. Revisit after ≥50 resolved prod trades + calibration refit.
-MAX_SINGLE_BET_PCT: float = 0.025    # hard 2.5% per-trade cap
-MIN_POSITION: float = 1.00
+# 2026-05-11: reverted 2.5% → 5%. The 2.5% tightening (made 5/10 ahead of
+# prod flip) created a structural conflict at small bankroll: Kalshi's
+# 1-contract granularity means the minimum real-world trade is ~$0.30-0.70,
+# which at sub-$30 bankroll silently exceeds 2.5%. 5% accommodates the
+# contract-granularity floor at any bankroll ≥ $10 while remaining bounded
+# by daily-loss (15%) and drawdown (25%) caps. Per-trade blast radius at
+# $200 bankroll = $10, at $15 = $0.78. Revisit if first cohort shows
+# any single-trade-driven drawdown event.
+MAX_SINGLE_BET_PCT: float = 0.05     # hard 5% per-trade cap
+# MIN_POSITION lowered 2026-05-11 from $1.00 → $0.50 so the absolute floor
+# never overrides the per-trade % cap at small bankroll. $0.50 ≈ 1 contract
+# at typical $0.30-0.70 price. Executor's max(1, int(size/price)) is the
+# real granularity floor anyway.
+MIN_POSITION: float = 0.50
 
 # Portfolio-level Kelly cap — audit M9.
 # Sum of open kellys + any proposed new kelly must not exceed bankroll * this.
@@ -81,6 +88,53 @@ CLUSTER_WINDOW_HOURS: int = 6
 MIN_EDGE: float = 0.08               # weather core
 MIN_EDGE_ARB: float = 0.02           # fee-inclusive arb edge floor
 ARB_MIN_LEGS: int = 3
+
+# ─── Phase A gates (shipped 2026-05-23 after Phase 0 validation) ─────────────
+#
+# Empirical findings from n=1186 settled shadow signals over ~234h:
+#
+# - BUY YES is structurally broken in our model's high-confidence regime.
+#   At cal_p ∈ [0.5, 1.0], actual yes-rate is 10-25% (deeply inverted).
+#   Spread inflation (1.55×) reduced but didn't eliminate this. The
+#   existing strategy.py guard was `cal_p >= 0.85`; data shows the
+#   failure regime starts at 0.5+. Tightened cap from 0.85 to 0.60.
+#
+# - BUY NO is EV-positive in a NARROW band of cal_p. Stratified analysis:
+#     cal_p ∈ [0.05, 0.10): 57% wins, no_ask~0.66 → EV −$0.09
+#     cal_p ∈ [0.10, 0.15): 67% wins, no_ask~0.69 → EV −$0.02
+#     cal_p ∈ [0.15, 0.20): 70% wins, no_ask~0.62 → EV +$0.08  ← sweet spot
+#     cal_p ∈ [0.20, 0.25): 65% wins, no_ask~0.60 → EV +$0.05  ← sweet spot
+#     cal_p ∈ [0.25, 0.30): 43% wins, no_ask~0.57 → EV −$0.14
+#   New: restrict BUY NO to cal_p ∈ [BUY_NO_CAL_P_LO, BUY_NO_CAL_P_HI).
+#
+# - Phoenix and Las Vegas have a hyper-sharp market (T-ticker market Brier
+#   0.003) AND model is most decisive there (cal_p_sd 0.25+, confident-
+#   wrong 31-35% of predictions). BUY-YES catastrophic (0/15 across PHX+LV).
+#   Excluded from trading universe entirely (still observed for shadow data).
+#
+# Path 1 retroactive validation (n=70 trades over 234h):
+#   ALL: 53% win rate, EV +$0.034/contract, cohort total +$2.39
+#   BUY_YES: 14% wins, EV +$0.078/contract (positive despite low rate)
+#   BUY_NO:  62% wins, EV +$0.023/contract
+# Honest CI on +$2.39 cohort total is wide (~−$2 to +$7 at 90%). Point
+# estimate supports the hypothesis; real fills confirm.
+
+# BUY YES disabled entirely as of 2026-05-28. Shadow calibration at n=1,824
+# (settled outcomes, not synthetic) showed the model's predictions in the
+# BUY-YES-eligible region [0.40, 0.60) have actual P(yes) ≈ 0.30 — i.e. the
+# model is anti-informative there. Market Brier on this cohort is 0.066 vs
+# model 0.353; the market dominates and there is no BUY YES sub-cohort where
+# the model beats the market. Paper BUY YES record was 0/2. Setting the cap
+# to 0.0 hard-filters every BUY YES (calibrated_p > 0.0 is always true).
+# Keep BUY_YES_ENABLED so re-enabling is a one-line flip if the premise changes.
+BUY_YES_ENABLED: bool = False
+BUY_YES_CAL_P_CAP: float = 0.60      # ignored while BUY_YES_ENABLED is False
+BUY_NO_CAL_P_LO: float = 0.15
+BUY_NO_CAL_P_HI: float = 0.30
+EXCLUDE_CITIES: frozenset[str] = frozenset({"Phoenix", "Las Vegas"})
+# Watch list (negative EV in shadow but tiny n=3-4): "Oklahoma City",
+# "New Orleans", "Philadelphia". Don't exclude pre-emptively; add to
+# EXCLUDE_CITIES if real-fill EV confirms negative over n≥10.
 
 # ─── Price filters ───────────────────────────────────────────────────────────
 MIN_PRICE: float = 0.15
@@ -104,7 +158,8 @@ SCAN_INTERVAL_SECONDS: int = 300
 # -$50, daily halt at -$30. Re-evaluate after first live cohort settles.
 MAX_DRAWDOWN_PCT: float = 0.25
 DAILY_LOSS_LIMIT_PCT: float = 0.15
-BANKROLL_STALE_SECONDS: int = 120    # fail-closed if bankroll older than this
+BANKROLL_STALE_SECONDS: int = 420    # fail-closed if bankroll older than this
+# 420s = SCAN_INTERVAL_SECONDS (300) + 2min buffer for slow API cycles
 
 # ─── Kalshi fees ─────────────────────────────────────────────────────────────
 KALSHI_FEE_RATE: float = 0.07
@@ -166,35 +221,78 @@ CITY_TZ: dict[str, str] = {
     "New Orleans":  "America/Chicago",
 }
 
-# NWS CLI (Climatological Report Daily) vs ASOS hourly bias, measured over 90
-# days of Kalshi production settlements (scripts/cli_gap_audit.py, 2026-04-27).
-# CLI is systematically warmer than ASOS — likely due to 5-minute vs hourly
-# peak capture.  Applied as an additive shift to raw GEFS members so that
-# probability calculations are anchored to the CLI settlement value rather than
-# the ASOS-aligned model output.
+# GEFS forecast bias correction (per city). Zeroed 2026-05-17 after the
+# shadow audit revealed the original cli_gap_audit measurement applied the
+# wrong fix in the wrong direction.
+#
+# History: cli_gap_audit.py (2026-04-27) measured the CLI-vs-ASOS gap
+# (~+0.6°F — CLI is systematically warmer than ASOS hourly observations
+# because CLI captures 5-minute peaks). The original code applied that
+# gap as an additive shift to GEFS members, on the assumption "GEFS is
+# ASOS-aligned." That assumption was never tested.
+#
+# Shadow-audit measurement (n=108 events, 2026-05-17): the actual
+# GEFS-vs-CLI bias is mean -0.44°F (essentially zero), median 0.00°F,
+# stdev 2.23°F. The original CLI_BIAS values are therefore introducing a
+# wrong-direction warm shift for cities that don't need one, and not
+# addressing the real failure mode (ensemble under-dispersion — see
+# v3_architecture_plan_20260512.md).
+#
+# Zeroed pending: (a) larger per-city sample (need n≥30/city to refit
+# reliably) and (b) isotonic calibration refit, which is the proper fix
+# for under-dispersion regardless of mean bias.
 CLI_BIAS: dict[str, float] = {
-    "NYC":          0.62,
-    "Chicago":      0.58,
-    "Miami":        0.97,
-    "LA":           0.80,
-    "Austin":       0.93,
-    "Denver":       0.93,
-    "Philadelphia": 0.72,
-    "Houston":      0.25,
-    "Boston":       0.54,
-    "Phoenix":      1.09,
-    "Dallas":       0.73,
-    "Seattle":      0.61,
-    "Atlanta":      0.90,
-    "SF":           0.95,
-    # New cities from Kalshi discovery — bias not yet measured. Default
-    # 0.0 = no shift; will calibrate as we accumulate resolved trades.
+    "NYC":          0.0,
+    "Chicago":      0.0,
+    "Miami":        0.0,
+    "LA":           0.0,
+    "Austin":       0.0,
+    "Denver":       0.0,
+    "Philadelphia": 0.0,
+    "Houston":      0.0,
+    "Boston":       0.0,
+    "Phoenix":      0.0,
+    "Dallas":       0.0,
+    "Seattle":      0.0,
+    "Atlanta":      0.0,
+    "SF":           0.0,
     "Las Vegas":    0.0,
     "San Antonio":  0.0,
     "Oklahoma City":0.0,
     "DC":           0.0,
     "New Orleans":  0.0,
 }
+
+# GEFS ensemble spread inflation factor (shipped 2026-05-17).
+#
+# Direct measurement from shadow audit: predicted ensemble SD median 1.43°F
+# (n=168 fresh signals); realized forecast-error stdev 2.23°F (n=108
+# settled events using max-p-bracket vs settled-YES-bracket as proxy for
+# forecast vs actual). Predicted/realized = 0.64x → actual forecast
+# uncertainty is ~1.55x wider than GEFS members suggest.
+#
+# Applied in forecast.get_ensemble_high() AFTER CLI_BIAS but BEFORE the
+# probability-from-members calculation. Each member is moved radially
+# outward from the ensemble mean by this factor:
+#     m' = mean + (m - mean) * SPREAD_INFLATION_FACTOR
+#
+# Effect on bracket probabilities: confident predictions (near 0 or near 1)
+# get pulled toward 0.5; bracket probabilities reflect true forecast
+# uncertainty rather than the artificially tight GEFS spread. Mathematically
+# principled correction for ensemble under-dispersion, well-known issue
+# with operational ensemble NWP.
+#
+# Set to 1.0 to disable inflation (returns to raw GEFS behavior).
+#
+# TODO (2026-05-17): build scripts/fit_spread_inflation.py — reads current
+# shadow_signal table, computes realized-error stdev vs predicted ensemble_sd
+# cohort-wide, recommends an updated factor. Per-city factors deferred until
+# n≥30/city (currently ~5-7/city). Adaptive auto-tuning rejected — manual
+# review preferred for load-bearing calibration parameters.
+#
+# Refit cadence: weekly while data accumulates (n→1000), monthly once stable.
+# Run the script, read the recommended value, update this constant manually.
+SPREAD_INFLATION_FACTOR: float = 1.55
 
 # Climatological monthly mean high temperatures (°F) per city. Used by the
 # Claude veto sanity-check prompt to give the model a comparison baseline

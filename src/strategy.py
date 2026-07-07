@@ -38,7 +38,13 @@ import forecast_health
 import kalshi_client
 import storage
 from config import (
+    BUY_NO_CAL_P_HI,
+    BUY_NO_CAL_P_LO,
+    BUY_YES_CAL_P_CAP,
+    BUY_YES_ENABLED,
     CLAUDE_VETO_ENABLED,
+    EXCLUDE_CITIES,
+    LIVE_TRADING_ENABLED,
     MAX_PRICE,
     MIN_EDGE,
     MIN_PRICE,
@@ -401,6 +407,21 @@ def compute_market_cal_p(market: dict, venue: str = "kalshi") -> float | None:
     moved against this open position?" without needing the market to
     surface as a fresh opportunity.
     """
+    full = compute_market_cal_p_full(market, venue=venue)
+    return full["cal_p"] if full else None
+
+
+def compute_market_cal_p_full(market: dict, venue: str = "kalshi") -> dict | None:
+    """Same as compute_market_cal_p but also returns ensemble statistics.
+
+    Returns dict with: cal_p, raw_p, ensemble_mean, ensemble_sd, ensemble_n.
+    None if forecast unavailable. Used by the Phase 2 shadow logger to
+    capture under-dispersion telemetry (2026-05-17): we measure realized
+    forecast error against ensemble_sd to quantify dispersion miscalibration
+    directly, instead of inferring it from the calibration buckets alone.
+    """
+    import statistics as _stats
+
     city = market.get("city", "")
     title = market.get("title") or market.get("question") or ""
     if not city or not title:
@@ -416,9 +437,17 @@ def compute_market_cal_p(market: dict, venue: str = "kalshi") -> float | None:
         return None
     try:
         raw_p = _raw_probability(bracket, members)
-        return float(calibration.calibrate(raw_p, venue=venue))
+        cal_p = float(calibration.calibrate(raw_p, venue=venue))
     except Exception:
         return None
+
+    return {
+        "cal_p": cal_p,
+        "raw_p": float(raw_p),
+        "ensemble_mean": float(_stats.fmean(members)),
+        "ensemble_sd": float(_stats.stdev(members)) if len(members) > 1 else 0.0,
+        "ensemble_n": len(members),
+    }
 
 
 def find_opportunities(markets: list[dict], bankroll: float,
@@ -468,6 +497,15 @@ def find_opportunities(markets: list[dict], bankroll: float,
                 (p.get("venue", "kalshi"), p.get("ticker", ""))
                 for p in storage.load_open_positions()
             }
+        # In paper trading mode, real Kalshi positions API returns nothing
+        # for our paper trades (no real orders placed). Union in DB paper
+        # positions so the same opportunity isn't re-logged every cycle.
+        if not LIVE_TRADING_ENABLED:
+            held |= {
+                (p.get("venue", "kalshi"), p.get("ticker", ""))
+                for p in storage.load_open_positions()
+                if p.get("paper_trade")
+            }
     else:
         held = {
             (p.get("venue", "kalshi"), p.get("ticker", ""))
@@ -491,6 +529,13 @@ def find_opportunities(markets: list[dict], bankroll: float,
 
         if not ticker or not city or not title:
             rej["missing_meta"] += 1
+            continue
+        # Phase A (2026-05-23): cities where the model is empirically
+        # unprofitable in both BUY YES (0/15 confident-YES in shadow audit)
+        # and BUY NO (44%/45% win rate, negative EV). Observer still
+        # collects these for ongoing measurement; trading skips them.
+        if city in EXCLUDE_CITIES:
+            rej["city_excluded"] += 1
             continue
         if (venue, ticker) in held:
             rej["already_held"] += 1
@@ -579,22 +624,38 @@ def find_opportunities(markets: list[dict], bankroll: float,
         #
         # Revisit once we have ~30 more resolved directional YES trades;
         # long-term fix is per-side isotonic calibration (see calibration.py).
+        # Phase A 2026-05-23: tightened cal_p cap from 0.85 to
+        # BUY_YES_CAL_P_CAP (currently 0.60). Shadow audit at n=1186 showed
+        # the failure regime starts at cal_p ~0.5 not 0.85 — actual yes-rate
+        # in [0.5, 0.7) is ~20%, [0.7, 1.0) is ~10%. Tighter cap closes the
+        # last of the broken-confidence-YES regime.
+        # BUY YES hard-disabled 2026-05-28 (see config.BUY_YES_ENABLED). The
+        # n=1,824 shadow calibration confirmed the model is anti-informative
+        # in the YES-eligible region and the market dominates everywhere.
         yes_filtered = (
-            calibrated_p >= 0.85
+            not BUY_YES_ENABLED
+            or calibrated_p > BUY_YES_CAL_P_CAP
             or (calibrated_p - yes_ask) < 0.30
             or is_1f_bin  # 1°F bin BUY YES — noise floor consumes window
         )
         if yes_filtered:
             edge_yes = -1.0
 
-        # BUY NO guard (same 2026-05-03 audit, n=66 resolved NO trades).
-        # Disagreement < 0.15 was 9W/6L (60% wr) but -$7.80 — losing despite
-        # winning 60%, because avg entry was $0.77 (expensive favorites need
-        # ~77% wr to break even). Cutting it lifts BUY NO from +$33 to +$41.
-        # Interim form of the price-aware edge floor (gross_edge/entry_price);
-        # the disagreement filter implicitly captures the price story because
-        # low NO-side disagreement correlates with high NO entry price.
-        no_filtered = ((1.0 - calibrated_p) - no_ask) < 0.15
+        # BUY NO guard (5/03 audit + Phase A 2026-05-23 band restriction).
+        # Original 5/03 filter: ((1-cal_p) - no_ask) < 0.15 (disagreement
+        # floor). Kept.
+        #
+        # Phase A addition: restrict cal_p to [BUY_NO_CAL_P_LO, BUY_NO_CAL_P_HI).
+        # Stratified shadow analysis (n=1186) found:
+        #   cal_p < 0.15: tail-of-distribution markets; model picks bracket
+        #     for very rare temperature ranges, but the no_ask is ~$0.66+
+        #     (expensive favorite) and actual wr only 57-67%. Negative EV.
+        #   cal_p ∈ [0.15, 0.30): 65-70% wins at avg no_ask ~$0.61. EV+ sweet spot.
+        #   cal_p ≥ 0.30: tiny n in shadow data and 43% wins. Skip.
+        no_filtered = (
+            ((1.0 - calibrated_p) - no_ask) < 0.15
+            or not (BUY_NO_CAL_P_LO <= calibrated_p < BUY_NO_CAL_P_HI)
+        )
         if no_filtered:
             edge_no = -1.0
 
