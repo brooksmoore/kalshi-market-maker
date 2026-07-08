@@ -2,9 +2,20 @@
 
 A from-scratch rewrite of the Kalshi weather-market autotrader.
 
-v1 (at `../polymarket-bot/`) ran live and lost 44% of a $100 bankroll over 135
-resolved trades. The forensic audit at
-`../polymarket-bot/AUDIT_REPORT_2026-04-23.md` identified three root causes:
+> **Status: RETIRED (July 2026) — by a pre-committed statistical test, not by neglect.**
+> Before evaluation, a kill criterion was written in advance: after 100 held-out settled
+> trades, if net-of-cost EV (fees + spread + slippage, with every fixable execution leak
+> closed) was still ≤ 0, the strategy would be declared dead. The verdict arrived at
+> **n = 154 settled paper trades: net EV = −$0.023/contract (FLOORED)**. Closing the
+> largest cost leak (taker→maker) recovered ~25% of the bleed without flipping the sign —
+> there was no rescuable edge underneath. Getting that answer cost under $5 of compute and
+> zero capital, versus the six weeks and real money the same lesson cost v1. The evaluation
+> harness (maker/checker split, walk-forward out-of-sample gate, effect-size bar) is the
+> reusable artifact; the weather thesis is the part that's dead. Process write-up:
+> [case study](https://github.com/brooksmoore/ai-orchestration-case-study).
+
+v1 (a private predecessor repo) ran live and lost 44% of a $100 bankroll over 135
+resolved trades. Its forensic audit (April 2026) identified three root causes:
 
 1. Gaussian + Claude-blended probabilities were systematically overconfident by
    ~20 percentage points.
@@ -149,3 +160,7 @@ PYTHONPATH=src pytest tests/ -v
 ```
 
 Last verified: 53 passed, 1 xfailed (planned tripwire).
+
+---
+
+*This bot is one of a small fleet of AI-built trading systems run under a read-only supervisory layer, built through a multi-model process (one model builds, a second audits independently). The process is documented in the [case study](https://github.com/brooksmoore/ai-orchestration-case-study).*
